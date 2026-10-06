@@ -171,8 +171,8 @@ def _models(raw: Any, path: Path) -> tuple[ModelConfig, ...]:
         if name in seen:
             raise ConfigError(f"{path}: {where}duplicate model name '{name}'")
         seen.add(name)
-        sessions = _int(entry, "sessions", path, where=where, minimum=1)
-        max_agents = _int(entry, "max_agents", path, where=where, default=sessions, minimum=1)
+        sessions = _int(entry, "sessions", path, where=where, minimum=0)
+        max_agents = _int(entry, "max_agents", path, where=where, default=sessions, minimum=0)
         if max_agents < sessions:
             raise ConfigError(
                 f"{path}: {where}'max_agents' ({max_agents}) must be >= 'sessions' ({sessions})"

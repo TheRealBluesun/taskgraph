@@ -131,6 +131,32 @@ fallback = "m1"
         self.assertEqual(cfg.models[1].fallback, "m1")
 
 
+class ModelCapacityTest(ConfigTestBase):
+    def test_zero_capacity_disables_a_model(self):
+        cfg = self.load_text(
+            MINIMAL_TOML
+            + """
+[[models]]
+name = "off"
+sessions = 0
+max_agents = 0
+"""
+        )
+        self.assertEqual(cfg.model("off"), ModelConfig(name="off", sessions=0, max_agents=0))
+
+    def test_max_agents_defaults_to_zero_sessions(self):
+        cfg = self.load_text(MINIMAL_TOML.replace("sessions = 2", "sessions = 0"))
+        self.assertEqual((cfg.models[0].sessions, cfg.models[0].max_agents), (0, 0))
+
+    def test_negative_sessions_and_max_agents_rejected(self):
+        self.assert_error(
+            MINIMAL_TOML.replace("sessions = 2", "sessions = -1"), "sessions' must be >= 0"
+        )
+        self.assert_error(
+            SPEC_TOML.replace("max_agents = 5", "max_agents = -1"), "max_agents' must be >= 0"
+        )
+
+
 class InvalidConfigTest(ConfigTestBase):
     def test_missing_required_root_key_names_key_and_file(self):
         err = self.assert_error(MINIMAL_TOML.replace('main = "main"\n', ""), "missing required key 'main'")
