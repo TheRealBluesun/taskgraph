@@ -8,9 +8,9 @@ the config lookup and the rendered holders table.
 import io
 import json
 import os
+import select
 import subprocess
 import sys
-import time
 import unittest
 from pathlib import Path
 
@@ -157,7 +157,12 @@ class CliTest(LeaseTestCase):
         self.assertTrue(wait_until(lambda: self.slot_names() == ["slot-0.json", "slot-1.json"]))
         third = self.spawn_lease(project, "simulator", "--", "sleep", "30")
         self.assertTrue(wait_until(lambda: "slot-2.json" not in self.slot_names()))
-        time.sleep(0.4)
+        # The first waiting line is printed before the first 2 s poll; wait for
+        # that write rather than a fixed sleep (startup stretches under load).
+        self.assertTrue(
+            wait_until(lambda: bool(select.select([third.stderr], [], [], 0)[0])),
+            "waiting lease wrote no message",
+        )
         third.terminate()
         third.wait(timeout=10)
         self.assertIn("waiting for simulator", third.stderr.read())

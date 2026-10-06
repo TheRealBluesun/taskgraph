@@ -8,9 +8,9 @@ subprocesses, because the staleness rule only trusts real lease processes.
 import json
 import io
 import os
+import select
 import subprocess
 import sys
-import time
 import unittest
 from pathlib import Path
 
@@ -239,7 +239,12 @@ class ContentionTest(LeaseTestCase):
         self.assertTrue(wait_until(lambda: self.slot_names() == ["slot-0.json"]), "first holds")
         second = self.spawn_lease(project, "simulator", "--", "sleep", "30")
         self.assertTrue(wait_until(lambda: self.slot_names() == ["slot-0.json"]))
-        time.sleep(0.6)  # let the second attempt fail and print its line
+        # The waiting line is printed before the first 2 s poll; wait for that
+        # write instead of a fixed sleep (startup stretches under load).
+        self.assertTrue(
+            wait_until(lambda: bool(select.select([second.stderr], [], [], 0)[0])),
+            "second lease wrote no message",
+        )
         second.terminate()  # no child yet: default SIGTERM disposition applies
         second.wait(timeout=10)
         self.assertIn("waiting for simulator (held by ? for", second.stderr.read())
