@@ -170,7 +170,7 @@ Default overlay `share/omp-agent.yml` disables `bash.autoBackground` and `eval.a
 (*why:* an agent's tour got auto-backgrounded, it ended its turn, and omp exited mid-task).
 
 `poll(record) -> "running" | "exited"`, plus watchdogs evaluated each tick:
-- **stall**: log size unchanged for `stall_secs` → kill the process group (SIGTERM, then SIGKILL after 10 s).
+- **stall**: log size unchanged for `stall_secs` → kill the process group (SIGTERM, then SIGKILL after 10 s) — EXCEPT while a `taskgraph lease` process whose cwd is inside the agent's worktree is alive (waiting for or holding a resource): omp does not stream a running command's output into its trace, so an agent queued for the simulator is silent by design (*why:* three healthy queued agents were killed as "stalled", 2026-10-05). Each lease process extends the deadline; a lease held longer than `agent.max_lease_secs` (default 1800) is reported as an `anomaly` event instead.
 - **startup hang**: only while the trace has no `"type":"tool_execution_start"` yet, and only a line beginning
   `Still starting after` within the first 20 lines (*why:* an agent reading the runner's source put that phrase
   into its trace and the old check killed it).
