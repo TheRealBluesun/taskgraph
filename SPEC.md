@@ -118,12 +118,16 @@ bucket `sessions` (once each bucket has ≥ 20 samples).
 
 A counting semaphore per resource, shared by all processes on the machine, replacing dev.sh's lock dir.
 
-- State dir: `$TASKGRAPH_STATE/leases/<resource>/` (default `~/.taskgraph/leases/…`); one file per held slot
-  `slot-<n>.json` = `{pid, cmd, cwd, task, since}`, created atomically (`os.open(O_CREAT|O_EXCL)`).
-- A slot is **stale** if its pid is dead *or* its pid's process is not a `taskgraph lease` process
-  (compare start time / command via `ps -o lstart=,command= -p`). Stale slots are removed by any waiter.
-  *why:* an agent copied the lock code into its own long-lived shell; the lock then named a process that never
-  exits and every test run deadlocked. Holders are only ever `taskgraph lease` itself.
+- State dir: `$TASKGRAPH_STATE/leases/<resource>/`; one file per slot `slot-<n>` (n < capacity), created once and
+  never deleted. **A slot is held iff some process holds `fcntl.flock(fd, LOCK_EX | LOCK_NB)` on it.** The lease
+  process acquires the lock, then truncates and writes `{pid, cmd, cwd, task, since}` JSON into the file (for
+  status/audit only — never used to decide ownership), keeps the fd open for the whole lease, and releases by
+  closing it. When a holder dies by any means (exit, crash, SIGKILL) the kernel drops the lock at once.
+  *why:* ownership by pid needed stale detection (dead pid? reused pid? which command?), and every variant
+  raced: two waiters removing the same stale slot, a failed `ps` marking a live holder dead, an agent's own shell
+  matching the command pattern, and an agent that copied the lock code into its long-lived shell deadlocked
+  everything. With flock there is no stale state to detect; only a process actually holding the lock owns a
+  slot. Waiters simply try each slot's lock in turn every 2 s.
 - CLI: `taskgraph lease <resource> [--task ID] -- <cmd…>`: wait for a slot (poll 2 s; print one line
   "waiting for <resource> (held by <task> for 73 s)" every 30 s), run cmd as a child with
   `TASKGRAPH_LEASE=<resource>` in its env, release the slot in `finally` and on SIGTERM/SIGINT (forward the signal to
