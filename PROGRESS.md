@@ -21,3 +21,11 @@
 - Line pattern `^[ \t]*[-*][ \t]+\[[ xX]\][ \t]+<id>(<rest>)?[ \t]*$` with id `[A-Z]+[0-9]+[a-z]?`; every other line (including lowercase ids, prose, unchecked non-list lines) is ignored. `[deps: A, B]` / `[res: A, B]` are stripped from `text` (tags are metadata, not prompt content), split on commas, blanks dropped. `res` is a tuple for symmetry with `deps` even though SPEC calls it display-only (nothing consumes it yet; T13/T15 may display it).
 - `mark_done` edits only the matched line by replacing the marker char in place (preserves spacing/CRLF/no-trailing-newline); already-done → unchanged; no line for id → `PlanError`.
 - Next tasks: T04 uses `parse` output + dict order for "plan order"; unknown/cross-dependency ids are left as-is here, ordering decides they count as done.
+
+## T04 — Ordering
+
+- Files: `taskgraph/order.py`, `tests/test_order.py` (15 new tests; suite now 53 tests, 0.07 s).
+- API: `runnable(tasks, running=(), blocked=(), started=None) -> list[Task]` and `critical_paths(tasks) -> dict[id, chain]` (exposed so tests can assert chains directly).
+- `started` is `Callable[[Task], int]`, lower = further along (0 notes+worktree, 1 worktree, 2 nothing); omitted → every task equal. Sort key is `(-chain, started_rank, plan_index)`, so plan order (dict insertion order) is only the final tie-break.
+- Chain = `1 + max(chain(pending dependents))`; done dependents are skipped, and a DFS back-edge (cycle) contributes 0 so `critical_paths` always terminates. Verified A1-last-in-plan wins over leaves, and A↔B cycles yield an empty `runnable`.
+- Next tasks: T05 metrics and T06 pool are independent. T13 (`run --dry-run`) should call `runnable` with a `started` callable built from worktree existence + `progress/<id>.md`; `blocked` ids come from scheduler state.
