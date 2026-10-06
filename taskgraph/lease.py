@@ -38,11 +38,22 @@ DEFAULT_STATE_DIR = "~/.taskgraph"
 POLL_SECS = 2.0
 MESSAGE_SECS = 30.0
 
+#: Shown by readers for a held slot whose info JSON is empty or half-written.
+STARTING = "starting…"
+
 _SLOT_FILE = re.compile(r"^slot-(\d+)$")
 
 
 class LeaseError(Exception):
     """A lease could not be created (e.g. the state dir is not writable)."""
+
+
+class WaitInterrupted(Exception):
+    """A terminating signal arrived while waiting for a slot (SPEC §5)."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"interrupted by signal {signum}")
+        self.signum = signum
 
 
 @dataclass(frozen=True)
@@ -147,7 +158,10 @@ def holders(
 
 
 def _held_slot(resource: str, n: int, path: Path) -> Slot | None:
-    """Return ``path``'s slot info if its lock is taken, else ``None``."""
+    """Return ``path``'s slot info if its lock is taken, else ``None``.
+
+    The probe fd is closed on both paths: ``holders`` runs every status tick.
+    """
     try:
         fd = os.open(path, os.O_RDWR)
     except OSError:
@@ -155,9 +169,19 @@ def _held_slot(resource: str, n: int, path: Path) -> Slot | None:
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        return _read_slot(resource, n, path)
-    os.close(fd)
+        slot = _read_slot(resource, n, path)
+        _close(fd)
+        return slot
+    _close(fd)
     return None
+
+
+def _close(fd: int) -> None:
+    """Close ``fd``, ignoring an already-closed/invalid descriptor."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def _read_slot(resource: str, n: int, path: Path) -> Slot:
@@ -178,11 +202,12 @@ def _read_slot(resource: str, n: int, path: Path) -> Slot:
     except (TypeError, ValueError):
         since = 0.0
     task = data.get("task")
+    cmd = str(data.get("cmd") or "").strip()
     return Slot(
         resource=resource,
         n=n,
         pid=pid,
-        cmd=str(data.get("cmd", "")),
+        cmd=cmd or STARTING,
         cwd=str(data.get("cwd", "")),
         task=str(task) if task is not None else None,
         since=since,
@@ -227,19 +252,25 @@ def try_acquire(
         except OSError:
             os.close(fd)
             continue
-        slot = Slot(
-            resource=resource,
-            n=n,
-            pid=os.getpid() if pid is None else pid,
-            cmd=payload_cmd,
-            cwd=os.getcwd() if cwd is None else cwd,
-            task=task,
-            since=time.time() if now is None else now,
-            path=path,
-            fd=fd,
-        )
-        _write_info(slot)
-        audit(base, "acquire", slot)
+        try:
+            slot = Slot(
+                resource=resource,
+                n=n,
+                pid=os.getpid() if pid is None else pid,
+                cmd=payload_cmd,
+                cwd=os.getcwd() if cwd is None else cwd,
+                task=task,
+                since=time.time() if now is None else now,
+                path=path,
+                fd=fd,
+            )
+            _write_info(slot)
+            audit(base, "acquire", slot)
+        except BaseException:
+            # The lock is ours; close it on every failure path so a caller's
+            # exception (or KeyboardInterrupt) cannot leak a held slot.
+            _close(fd)
+            raise
         return slot
     return None
 
@@ -331,12 +362,15 @@ def wait_for_slot(
     timeout: float | None = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    abort: Callable[[], int | None] | None = None,
 ) -> Slot | None:
     """Wait for a free slot of ``resource``, or ``None`` after ``timeout``.
 
     Prints ``waiting for <resource> (held by <task> for <n> s)`` on entering the
     wait and then at most every ``message_secs`` (SPEC §5).  Slots are retried
-    every ``poll`` seconds.
+    every ``poll`` seconds.  ``abort`` is polled each round; a signal number
+    raises :class:`WaitInterrupted` (the CLI blocks terminating signals and
+    must abort rather than swallow them).
     """
     stream = sys.stderr if out is None else out
     base = _root(root)
@@ -346,6 +380,10 @@ def wait_for_slot(
         slot = try_acquire(resource, capacity, root=base, task=task, cmd=cmd, cwd=cwd)
         if slot is not None:
             return slot
+        if abort is not None:
+            signum = abort()
+            if signum is not None:
+                raise WaitInterrupted(signum)
         if timeout is not None and clock() - started >= timeout:
             return None
         if message_secs is not None and (

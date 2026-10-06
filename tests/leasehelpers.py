@@ -167,3 +167,30 @@ class LeaseTestCase(unittest.TestCase):
             elif fields[1] == "release":
                 depth -= 1
         return peak
+
+    def skip_if_no_fd_listing(self) -> None:
+        """Skip when the OS exposes no listable descriptor directory."""
+        for directory in ("/dev/fd", "/proc/self/fd"):
+            if os.path.isdir(directory):
+                return
+        self.skipTest("no /dev/fd or /proc/self/fd to count descriptors")
+
+    def group_members(self, pgid: int) -> list:
+        """Pids in process group ``pgid`` (portable across macOS/Linux pgrep flags)."""
+        out = subprocess.run(
+            ["ps", "-A", "-o", "pid=,pgid="], capture_output=True, text=True, timeout=10
+        ).stdout
+        return [
+            parts[0]
+            for parts in (line.split() for line in out.splitlines())
+            if len(parts) >= 2 and parts[1] == str(pgid)
+        ]
+
+    def open_fds(self) -> int:
+        """Number of descriptors this process currently holds."""
+        for directory in ("/dev/fd", "/proc/self/fd"):
+            try:
+                return len(os.listdir(directory))
+            except OSError:
+                continue
+        self.skipTest("no /dev/fd or /proc/self/fd to count descriptors")

@@ -7,16 +7,24 @@ replaces one "not implemented" stub with the real handler.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterator, Sequence, TextIO
+from typing import Sequence, TextIO
 
 from . import lease
 from .config import ConfigError, load
+from .procsig import (
+    GROUP_GRACE,
+    SignalForwarder,
+    block_terminating_signals,
+    ignore_sigpipe,
+    pending_terminating_signal,
+    restore_mask,
+    swallow_signal,
+    terminate_group,
+)
 
 CONFIG_NAME = "taskgraph.toml"
 TIMEOUT_EXIT = 124
@@ -85,45 +93,6 @@ def format_holders(slots: Sequence[lease.Slot], now: float | None = None) -> str
     ).rstrip()
 
 
-@contextlib.contextmanager
-def forward_signals(proc: subprocess.Popen) -> Iterator[None]:
-    """Forward SIGTERM/SIGINT to ``proc``'s process group while waiting.
-
-    The leased command is started in its own session, so signalling only its
-    pid would leave ``sh -c 'build; test'``-style grandchildren running — and a
-    killed build that keeps going keeps the resource busy.  The wrapper keeps
-    waiting for the child instead of dying first, so the slot is only released
-    after the command it guards has actually stopped (SPEC §5).  Silently does
-    nothing off the main thread, where ``signal`` forbids handlers.
-    """
-
-    def handler(signum: int, _frame: object) -> None:
-        if proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signum)
-        except OSError:
-            try:
-                proc.send_signal(signum)
-            except OSError:
-                pass
-
-    saved: dict[int, object] = {}
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            saved[sig] = signal.signal(sig, handler)
-        except (ValueError, OSError, RuntimeError):
-            pass
-    try:
-        yield
-    finally:
-        for sig, previous in saved.items():
-            try:
-                signal.signal(sig, previous)
-            except (ValueError, OSError, RuntimeError):
-                pass
-
-
 def run_lease(
     resource: str,
     command: Sequence[str],
@@ -135,6 +104,7 @@ def run_lease(
     message_secs: float | None = lease.MESSAGE_SECS,
     out: TextIO | None = None,
     timeout: float | None = None,
+    group_grace: float = GROUP_GRACE,
 ) -> int:
     """Wait for a lease, run ``command`` under it, and return its exit status.
 
@@ -142,41 +112,74 @@ def run_lease(
     the deny shims (SPEC §5) check.  Returns 124 when ``timeout`` expires while
     waiting and 127 when the command cannot be executed; a child killed by
     signal *n* reports the shell's ``128 + n``.
+
+    Forwarding handlers are installed before the slot is acquired and the
+    terminating signals stay blocked while waiting, so the wrapper can never die
+    between acquiring the slot and attaching the child.  The mask is restored
+    before the child is spawned (a fork would inherit it).  After the direct
+    child exits its group is emptied (SIGTERM, then SIGKILL after
+    ``group_grace``) before the slot is released.
     """
     stream = sys.stderr if out is None else out
     base = Path(root) if root is not None else lease.state_root()
-    try:
-        slot = lease.wait_for_slot(
-            resource,
-            capacity,
-            root=base,
-            task=task,
-            cmd=command,
-            poll=poll,
-            message_secs=message_secs,
-            out=stream,
-            timeout=timeout,
-        )
-    except KeyboardInterrupt:
-        print(f"taskgraph lease: interrupted while waiting for {resource}", file=stream, flush=True)
-        return 130
-    if slot is None:
-        print(f"taskgraph lease: timed out waiting for {resource}", file=stream, flush=True)
-        return TIMEOUT_EXIT
-    env = dict(os.environ)
-    env[lease.LEASE_ENV] = resource
+    ignore_sigpipe()
+    forwarder = SignalForwarder()
+    forwarder.install()
+    previous = block_terminating_signals()
+    blocked = previous is not None
     try:
         try:
-            # Own session: its pid is a process-group id, so a forwarded signal
-            # reaches the whole leased command tree (see forward_signals).
-            proc = subprocess.Popen(list(command), env=env, start_new_session=True)
-        except OSError as exc:
-            print(f"taskgraph lease: cannot run {command[0]!r}: {exc}", file=stream, flush=True)
-            return 127
-        with forward_signals(proc):
+            slot = lease.wait_for_slot(
+                resource,
+                capacity,
+                root=base,
+                task=task,
+                cmd=command,
+                poll=poll,
+                message_secs=message_secs,
+                out=stream,
+                timeout=timeout,
+                abort=pending_terminating_signal if blocked else None,
+            )
+        except lease.WaitInterrupted as exc:
+            swallow_signal(exc.signum, previous)
+            print(
+                f"taskgraph lease: interrupted while waiting for {resource}",
+                file=stream,
+                flush=True,
+            )
+            return 128 + exc.signum
+        except KeyboardInterrupt:
+            print(
+                f"taskgraph lease: interrupted while waiting for {resource}",
+                file=stream,
+                flush=True,
+            )
+            return 130
+        if slot is None:
+            print(f"taskgraph lease: timed out waiting for {resource}", file=stream, flush=True)
+            return TIMEOUT_EXIT
+        restore_mask(previous)
+        env = dict(os.environ)
+        env[lease.LEASE_ENV] = resource
+        try:
+            try:
+                # Own session: its pid is a process-group id, so a forwarded
+                # signal reaches the whole leased command tree.
+                proc = subprocess.Popen(list(command), env=env, start_new_session=True)
+            except OSError as exc:
+                print(
+                    f"taskgraph lease: cannot run {command[0]!r}: {exc}", file=stream, flush=True
+                )
+                return 127
+            forwarder.attach(proc)
             code = proc.wait()
+            terminate_group(proc.pid, grace=group_grace)
+        finally:
+            lease.release(slot, root=base)
     finally:
-        lease.release(slot, root=base)
+        forwarder.restore()
+        restore_mask(previous)
     return code if code >= 0 else 128 - code
 
 

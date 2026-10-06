@@ -11,12 +11,26 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import unittest
 from pathlib import Path
 
 from leasehelpers import BIN, MINIMAL_TOML, LeaseTestCase, wait_until
 
 from taskgraph import cli, lease
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while ``pid`` still exists (a reaped process returns False)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 class FormattingTest(unittest.TestCase):
@@ -174,17 +188,6 @@ class CliTest(LeaseTestCase):
             proc.wait(timeout=10)
         self.assertTrue(wait_until(lambda: self.held_names() == []))
 
-    def group_members(self, pgid: int) -> list:
-        """Pids in process group ``pgid`` (portable across macOS/Linux pgrep flags)."""
-        out = subprocess.run(
-            ["ps", "-A", "-o", "pid=,pgid="], capture_output=True, text=True, timeout=10
-        ).stdout
-        return [
-            parts[0]
-            for parts in (line.split() for line in out.splitlines())
-            if len(parts) >= 2 and parts[1] == str(pgid)
-        ]
-
     def test_forwarded_signal_stops_the_whole_leased_command_tree(self):
         project = self.project()
         pidfile = self.base / "child.pid"
@@ -267,6 +270,16 @@ class SignalTest(LeaseTestCase):
         self.assertTrue(wait_until(lambda: self.held_names() == []), "slot freed")
         self.assertIsNotNone(self.acquire_slot())
 
+    def signal_case(self, tag: str, signum: int) -> None:
+        """Signal the wrapper; the slot frees only once its child tree is gone."""
+        project = self.project()
+        proc = self.holder(project, tag)
+        pgid = self.child_pgid(self.base / f"{tag}.pid")
+        os.kill(proc.pid, signum)
+        self.assertEqual(proc.wait(timeout=10), 128 + int(signum))
+        self.assertTrue(wait_until(lambda: self.group_members(pgid) == []), "child tree gone")
+        self.assert_released()
+
     def test_sigterm_frees_the_slot(self):
         proc = self.holder(self.project(), "term")
         proc.terminate()
@@ -279,11 +292,111 @@ class SignalTest(LeaseTestCase):
         proc.wait(timeout=10)
         self.assert_released()
 
+    def test_sighup_frees_the_slot(self):
+        self.signal_case("hup", signal.SIGHUP)
+
+    def test_sigquit_frees_the_slot(self):
+        self.signal_case("quit", signal.SIGQUIT)
+
     def test_sigkill_frees_the_slot(self):
         proc = self.holder(self.project(), "kill")
         proc.kill()
         proc.wait(timeout=10)
         self.assert_released()
+
+    def test_signal_while_waiting_aborts_without_taking_the_slot(self):
+        project = self.project()
+        first = self.spawn_lease(project, "simulator", "--", "sleep", "30")
+        self.assertTrue(wait_until(lambda: self.held_names() == ["slot-0"]), "holder acquired")
+        second = self.spawn_lease(project, "simulator", "--", "sleep", "30")
+        self.assertTrue(
+            wait_until(lambda: bool(select.select([second.stderr], [], [], 0)[0])),
+            "waiter wrote no message",
+        )
+        second.terminate()
+        self.assertEqual(second.wait(timeout=10), 128 + signal.SIGTERM)
+        self.assertEqual(self.held_names(), ["slot-0"])  # the holder keeps it
+        first.terminate()
+        first.wait(timeout=10)
+        self.assertTrue(wait_until(lambda: self.held_names() == []))
+
+
+class GrandchildTest(LeaseTestCase):
+    """A dead direct child must not release the slot while its tree still runs."""
+
+    def kill_pid(self, pidfile: Path) -> None:
+        try:
+            pid = int(pidfile.read_text())
+        except (OSError, ValueError):
+            return
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    def test_slot_released_only_after_the_grandchild_dies(self):
+        project = self.project()
+        grand = self.base / "grand.py"
+        grand.write_text(
+            "import os, signal, sys, time\n"
+            "for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):\n"
+            "    signal.signal(s, signal.SIG_IGN)\n"
+            "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+            "time.sleep(30)\n"
+        )
+        direct = self.base / "direct.py"
+        direct.write_text(
+            "import os, subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n"
+            "open(sys.argv[3], 'w').write(str(os.getpid()))\n"
+            "time.sleep(30)\n"
+        )
+        grand_pid = self.base / "grand.pid"
+        direct_pid = self.base / "direct.pid"
+        result: dict = {}
+
+        def run() -> None:
+            result["code"] = cli.run_lease(
+                "simulator",
+                [sys.executable, str(direct), str(grand), str(grand_pid), str(direct_pid)],
+                capacity=1,
+                root=self.state,
+                group_grace=0.8,
+            )
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.addCleanup(self.kill_pid, grand_pid)
+        self.addCleanup(thread.join, 15)
+
+        def pid(path: Path) -> int:
+            try:
+                return int(path.read_text())
+            except (OSError, ValueError):
+                return 0
+
+        self.assertTrue(wait_until(lambda: pid(grand_pid) and pid(direct_pid)), "tree started")
+        self.assertTrue(wait_until(lambda: self.held_names() == ["slot-0"]), "slot held")
+        gp = pid(grand_pid)
+        os.kill(pid(direct_pid), signal.SIGKILL)  # direct child dies, grandchild survives
+        seen = {"alive_while_held": False, "released_while_alive": False}
+
+        def track() -> bool:
+            alive = _pid_alive(gp)
+            held = self.held_names() == ["slot-0"]
+            if alive and held:
+                seen["alive_while_held"] = True
+            if alive and not held:
+                seen["released_while_alive"] = True
+            return not alive
+
+        self.assertTrue(wait_until(track, timeout=15), "grandchild was never killed")
+        self.assertTrue(seen["alive_while_held"], "slot was not held while it lived")
+        self.assertFalse(seen["released_while_alive"], "slot released before the tree was gone")
+        thread.join(timeout=15)
+        self.assertFalse(thread.is_alive(), "lease wrapper did not return")
+        self.assertEqual(result.get("code"), 128 + signal.SIGKILL)
+        self.assertTrue(wait_until(lambda: self.held_names() == []), "slot released")
 
 
 if __name__ == "__main__":

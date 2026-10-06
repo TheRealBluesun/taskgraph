@@ -11,6 +11,7 @@ import io
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -143,6 +144,50 @@ class FlockTest(LeaseTestCase):
             os.close(fd)
         self.assertIsNotNone(self.acquire_slot())
 
+    def test_empty_or_partial_info_reads_as_starting(self):
+        fd = self.hold_fd("simulator", 0)
+        self.addCleanup(os.close, fd)
+        path = lease.resource_dir(self.state, "simulator") / "slot-0"
+        for content in ("", "{", '{"pid": 12, "cmd"'):
+            with self.subTest(content=content):
+                path.write_text(content)
+                held = lease.holders(self.state)
+                self.assertEqual(len(held), 1)
+                self.assertEqual(held[0].cmd, lease.STARTING)
+        path.write_text(json.dumps({"pid": 1, "cmd": "", "cwd": "", "task": None, "since": 0.0}))
+        self.assertEqual(lease.holders(self.state)[0].cmd, lease.STARTING)
+        path.write_text(json.dumps({"pid": 1, "cmd": " xcodebuild ", "cwd": "", "task": None,
+                                    "since": 0.0}))
+        self.assertEqual(lease.holders(self.state)[0].cmd, "xcodebuild")
+
+    def test_listing_held_slots_does_not_leak_fds(self):
+        self.skip_if_no_fd_listing()
+        fd = self.hold_fd("simulator", 0)
+        self.addCleanup(os.close, fd)
+        lease.holders(self.state)  # warm up lazily-created descriptors
+        before = self.open_fds()
+        for _ in range(200):
+            self.assertEqual(len(lease.holders(self.state)), 1)
+        self.assertLessEqual(self.open_fds() - before, 4)
+
+    def test_failed_acquire_write_closes_its_lock_fd(self):
+        self.skip_if_no_fd_listing()
+        before = self.open_fds()
+        original = lease._write_info
+
+        def boom(_slot):
+            raise RuntimeError("disk full")
+
+        lease._write_info = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                lease.try_acquire("simulator", 1, root=self.state)
+        finally:
+            lease._write_info = original
+        self.assertLessEqual(self.open_fds() - before, 4)
+        self.assertEqual(lease.holders(self.state), [])  # lock was dropped
+        self.assertIsNotNone(self.acquire_slot())
+
     def test_closing_the_fd_drops_the_lock(self):
         path = lease.resource_dir(self.state, "simulator") / "slot-0"
         fd = self.hold_fd("simulator", 0)
@@ -253,6 +298,23 @@ class WaitForSlotTest(LeaseTestCase):
         self.assertIsNotNone(slot)
         self.assertEqual(slot.task, "T07")
         self.release_slot(slot)
+
+    def test_abort_reports_the_pending_signal(self):
+        holder = self.acquire_slot(task="F03")
+        try:
+            with self.assertRaises(lease.WaitInterrupted) as caught:
+                lease.wait_for_slot(
+                    "simulator",
+                    1,
+                    root=self.state,
+                    task="T07",
+                    poll=0.02,
+                    out=io.StringIO(),
+                    abort=lambda: int(signal.SIGHUP),
+                )
+            self.assertEqual(caught.exception.signum, int(signal.SIGHUP))
+        finally:
+            self.release_slot(holder)
 
 
 class ContentionTest(LeaseTestCase):
