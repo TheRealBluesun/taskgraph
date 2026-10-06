@@ -171,6 +171,7 @@ class Scheduler:
         """Advance the scheduler by one step and persist any state change."""
         now = self._now()
         self._reload()
+        self._consume_intents()
         self._record_metrics(now)
         self._drain()
         self._watch(now)
@@ -193,6 +194,24 @@ class Scheduler:
             summary = ", ".join(f"{m.name}={m.sessions}/{m.max_agents}" for m in new.models)
             self._event("pool", "-", f"models {summary or 'none'}")
         self.cfg = new
+
+    def _consume_intents(self) -> None:
+        """Apply ``taskgraph retry`` requests written by another process (SPEC §10).
+
+        Requests are files under the project's ``pending/`` directory rather than
+        ``state.json`` edits, so this loop's own saves cannot lose one.  Applying
+        a request also forgets the task's record: the operator asked for a new
+        attempt, so a dead agent must not go down the "exited" path and re-block
+        the task in the same tick.
+        """
+        for tid in state.take_intents(self.project, self.state_root):
+            record = self.running.pop(tid, None)
+            if record is not None:
+                agent.kill(record, timeout=self._kill_timeout)
+            self.state.blocked.pop(tid, None)
+            self.state.retries.pop(tid, None)
+            self.forced.pop(tid, None)
+            self._event("retry", tid, "retry requested by the operator")
 
     def _record_metrics(self, now: float) -> None:
         """Record one metrics sample per model that has an endpoint (SPEC §4)."""
@@ -317,8 +336,12 @@ class Scheduler:
         if model is None:
             self._block(task.id, f"model {name} is not configured")
             return
+        # A worktree that is already there holds an interrupted agent's partial
+        # work — after a retry, a `taskgraph retry`, or a `stop --agents` — so
+        # this agent must be told to continue rather than start over (SPEC §6).
+        resume = worktree.is_resume(self.cfg, task.id)
         try:
-            if not worktree.exists(self.cfg, task.id):
+            if not resume:
                 worktree.create(self.cfg, task.id)
             record = agent.start(
                 task,
@@ -326,6 +349,7 @@ class Scheduler:
                 worktree.path(self.cfg, task.id),
                 self.cfg,
                 self.state,
+                resume=resume,
                 root=self.state_root,
                 now=now,
             )
@@ -335,7 +359,7 @@ class Scheduler:
         self.running[task.id] = record
         self.forced.pop(task.id, None)
         assigned[name] += 1
-        suffix = " (resume)" if self.state.retries.get(task.id, 0) else ""
+        suffix = " (resume)" if resume else ""
         self._event("start", task.id, f"{name} pid {record.pid}{suffix}")
 
     def _block(self, tid: str, reason: str) -> None:

@@ -13,8 +13,8 @@ import sys
 from pathlib import Path
 from typing import Sequence, TextIO
 
-from . import assign, lease, scheduler
-from .config import ConfigError, load
+from . import assign, control, lease, scheduler, worktree
+from .config import Config, ConfigError, load
 from .procsig import (
     GROUP_GRACE,
     SignalForwarder,
@@ -211,27 +211,34 @@ def _cmd_run(args: argparse.Namespace) -> int:
     ).run()
 
 
+def _project_config(command: str) -> Config | None:
+    """Load the nearest project config for ``command``; ``None`` after reporting why not."""
+    config_path = find_config()
+    if config_path is None:
+        print(
+            f"taskgraph {command}: no {CONFIG_NAME} found in this directory or its parents",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return load(config_path)
+    except ConfigError as exc:
+        print(f"taskgraph {command}: {exc}", file=sys.stderr)
+        return None
+
+
 def _cmd_lease(args: argparse.Namespace) -> int:
     """``taskgraph lease``: wait for a resource slot, then run the command (SPEC §5)."""
     if not args.cmd:
         print("taskgraph lease: no command given", file=sys.stderr)
         return 2
-    config_path = find_config()
-    if config_path is None:
-        print(
-            f"taskgraph lease: no {CONFIG_NAME} found in this directory or its parents",
-            file=sys.stderr,
-        )
-        return 2
-    try:
-        config = load(config_path)
-    except ConfigError as exc:
-        print(f"taskgraph lease: {exc}", file=sys.stderr)
+    config = _project_config("lease")
+    if config is None:
         return 2
     capacity = config.resources.get(args.resource)
     if capacity is None:
         print(
-            f"taskgraph lease: resource '{args.resource}' is not in [resources] of {config_path}",
+            f"taskgraph lease: resource '{args.resource}' is not in [resources] of {config.path}",
             file=sys.stderr,
         )
         return 2
@@ -241,6 +248,49 @@ def _cmd_lease(args: argparse.Namespace) -> int:
 def _cmd_leases(args: argparse.Namespace) -> int:
     """``taskgraph leases``: print current holders and their ages (SPEC §5)."""
     print(format_holders(lease.holders()))
+    return 0
+
+
+def _cmd_stop(args: argparse.Namespace) -> int:
+    """``taskgraph stop``: stop the scheduler; ``--agents`` stops agents too (SPEC §7)."""
+    config = _project_config("stop")
+    if config is None:
+        return 2
+    try:
+        result = control.stop(config.root, agents=args.agents)
+    except control.ControlError as exc:
+        print(f"taskgraph stop: {exc}", file=sys.stderr)
+        return 1
+    if result.pid is None:
+        print(f"taskgraph stop: no scheduler running for {config.root}", file=sys.stderr)
+    else:
+        how = "killed" if result.forced else "stopped"
+        print(f"taskgraph stop: {how} scheduler pid {result.pid}")
+    if args.agents:
+        if result.agents:
+            print(f"taskgraph stop: stopped agents {', '.join(result.agents)}")
+        else:
+            print("taskgraph stop: no agents running", file=sys.stderr)
+    return 0 if result.stopped_anything() else 1
+
+
+def _cmd_retry(args: argparse.Namespace) -> int:
+    """``taskgraph retry <id>``: unblock a task and resume its worktree (SPEC §10)."""
+    config = _project_config("retry")
+    if config is None:
+        return 2
+    try:
+        result = control.retry(config, args.id)
+    except control.ControlError as exc:
+        print(f"taskgraph retry: {exc}", file=sys.stderr)
+        return 1
+    where = ""
+    if worktree.is_resume(config, result.id):
+        where = f"; {worktree.path(config, result.id)} will be resumed"
+    if result.was_blocked:
+        print(f"taskgraph retry: queued a retry for {result.id} (was blocked: {result.reason}){where}")
+    else:
+        print(f"taskgraph retry: queued a retry for {result.id} (it was not blocked){where}")
     return 0
 
 
@@ -259,6 +309,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.choices["run"].set_defaults(func=_cmd_run)
     sub.choices["lease"].set_defaults(func=_cmd_lease)
     sub.choices["leases"].set_defaults(func=_cmd_leases)
+    sub.choices["stop"].set_defaults(func=_cmd_stop)
+    sub.choices["retry"].set_defaults(func=_cmd_retry)
 
     run = sub.choices["run"]
     run.add_argument("--project", metavar="DIR", help="project root (default: cwd)")

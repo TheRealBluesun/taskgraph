@@ -105,6 +105,64 @@ def lock_path(project_root: Path | str, root: Path | str | None = None) -> Path:
     return project_dir(project_root, root) / "lock"
 
 
+#: Suffix of an operator retry request (SPEC §10 ``taskgraph retry``).
+RETRY_SUFFIX = ".retry"
+
+#: Suffix a consumer renames a request to before applying it, so a crash
+#: between renaming and applying leaves a file the next collection takes again.
+CLAIM_SUFFIX = ".claimed"
+
+
+def pending_dir(project_root: Path | str, root: Path | str | None = None) -> Path:
+    """Return the project's ``pending/`` directory of operator requests."""
+    return project_dir(project_root, root) / "pending"
+
+
+def request_retry(project_root: Path | str, tid: str, root: Path | str | None = None) -> Path:
+    """Write ``tid``'s retry request; it stays until the scheduler consumes it.
+
+    ``taskgraph retry`` cannot simply edit ``state.json``: a running scheduler
+    owns that file and rewrites it from memory every tick, so the edit could be
+    overwritten before the loop ever notices it.  A request file is durable and
+    outside anything the loop writes.
+    """
+    path = pending_dir(project_root, root) / f"{tid}{RETRY_SUFFIX}"
+    _write_atomic(path, json.dumps({"pid": os.getpid()}) + "\n")
+    return path
+
+
+def take_intents(project_root: Path | str, root: Path | str | None = None) -> list[str]:
+    """Return the task ids of every pending retry request, removing those files.
+
+    Each request is renamed to ``<id>.retry.claimed`` before it is removed: one
+    written while this is collecting survives for the next collection, and one
+    whose consumer died between renaming and applying is taken again.
+    """
+    directory = pending_dir(project_root, root)
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return []
+    tids: list[str] = []
+    for path in entries:
+        name = path.name
+        if name.endswith(RETRY_SUFFIX + CLAIM_SUFFIX):
+            tid = name[: -len(RETRY_SUFFIX + CLAIM_SUFFIX)]
+            claimed = path
+        elif name.endswith(RETRY_SUFFIX):
+            tid = name[: -len(RETRY_SUFFIX)]
+            claimed = path.with_name(name + CLAIM_SUFFIX)
+            try:
+                os.replace(path, claimed)
+            except OSError:
+                continue
+        else:
+            continue
+        tids.append(tid)
+        claimed.unlink(missing_ok=True)
+    return tids
+
+
 # ----------------------------------------------------------------------- state file
 
 
@@ -161,6 +219,25 @@ def pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def process_state(pid: int) -> str | None:
+    """Return ``ps``'s state letter for ``pid`` (``"Z"`` = zombie), or ``None``.
+
+    A zombie keeps its pid but runs no code, so a caller waiting for a process
+    to stop must treat it as gone — it only lingers until its parent reaps it.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    letter = out.stdout.strip()
+    return letter[:1] or None
 
 
 def process_start_time(pid: int) -> float | None:
