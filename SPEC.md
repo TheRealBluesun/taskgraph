@@ -79,6 +79,12 @@ Cycles must not recurse forever (treat a back-edge as chain 0).
 
 ## 4. Model pool (pure: `taskgraph.pool`)
 
+`[[models]]` order is **priority**: fastest/best first (e.g. a local GPU), auxiliary paid models last, so an
+auxiliary agent starts only when every earlier model is full and runnable work remains. The scheduler re-reads
+the `[[models]]` section every tick when the file's mtime changes (log `pool …`), so an operator can retune
+("stop using .10 today", "allow 4 auxiliary agents") without a restart; agents already running keep their model,
+and a model over its new limit simply gets no new agents. `sessions = max_agents = 0` disables a model.
+
 Each running agent is assigned one model. `choose_model(models, assigned, load, now, last_extra) -> name | None`:
 
 - If a model has `assigned < sessions` → it is free (first in config order wins).
