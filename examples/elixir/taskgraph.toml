@@ -1,0 +1,62 @@
+# taskgraph.toml — the Elixir project (SPEC §1).
+#
+# This is the whole project-specific surface: taskgraph itself is project-agnostic.
+# Copy it to the project root (`cp examples/elixir/taskgraph.toml .`) and edit.
+
+plan = "PLAN.md"                            # task list, one `- [ ] ID text [deps: …]` per line (SPEC §2)
+prompt = "PROMPT.md"                        # general agent instructions, prepended with each task header (SPEC §6)
+gate = "./dev.sh build && ./dev.sh test"    # must pass in the rebased worktree before a merge (SPEC §8)
+worktrees = "../elixir-wt"                  # worktree base dir, relative to this project root (a sibling of the checkout)
+main = "main"                               # integration branch: task branches are cut from it and fast-forwarded into it
+links = [".env"]                            # files symlinked into each new worktree (secrets: linked, never copied)
+
+# How each coding agent is launched and watched (SPEC §6). A `deny` entry gets a shim first on the
+# agent's PATH: outside a lease it prints "run it through ./dev.sh" and exits 64, so the only way to
+# touch the simulator is through a lease (SPEC §5, examples/elixir/dev-sh-lease.md).
+[agent]
+command = "omp -p --mode json --auto-approve --no-session --model {model} --thinking high --max-time 120m --config {overlay} @{prompt_file}"
+overlay = "omp-agent.yml"                   # taskgraph's default: omp auto-background disabled (SPEC §6)
+stall_secs = 480                            # no trace growth for 8 min — and no lease holder in the worktree → kill
+max_lease_secs = 1800                       # a lease held longer than 30 min is reported as an `anomaly` event
+retries = 2                                 # resumes after an agent exits without .done, then blocks
+deny = ["xcodebuild", "xcrun"]              # one simulator: agents must go through ./dev.sh
+
+# Counting semaphores shared by every process on the machine (SPEC §5). Elixir has exactly one
+# simulator, so capacity 1; add `build = 1` here if you also want the compile step serialized.
+[resources]
+simulator = 1
+
+# Priority order: the first model with room gets a new agent, so fastest/best first, auxiliary paid
+# models last (SPEC §4). sessions = concurrent agents; max_agents = agents allowed while the server's
+# metrics show idle capacity (agents blocked on a build/lease do not use the GPU); metrics = vLLM
+# Prometheus URL (optional, but it enables the slack rule and the idle diagnostics).
+[[models]]
+name = "local-vllm-flash/Qwen3.8-Flash-Next"
+sessions = 1                                # one long-context coding request at a time on the .10 server
+max_agents = 2
+metrics = "http://10.10.10.10:8000/metrics"
+
+[[models]]
+name = "local-vllm-27b/Qwen3.8-27B"
+sessions = 3                                # total generation peaks at ~3 concurrent requests on the .15 server
+max_agents = 5
+metrics = "http://10.10.10.15:8002/metrics"
+fallback = "deepseek/deepseek-v4-flash"     # rate-limited here → restart this task on the overflow model (SPEC §6)
+
+[[models]]
+name = "deepseek/deepseek-v4-flash"         # auxiliary, paid: only when both local GPUs are full and work is waiting
+sessions = 2
+max_agents = 2
+
+trailer = ["Co-authored-by: taskgraph <noreply@taskgraph>"]   # appended to every merge commit (SPEC §8)
+
+# Refuse a merge commit that looks like a build dump (SPEC §8). The defaults already block
+# .build/ build/ DerivedData/ node_modules/ __pycache__/ target/ dist/.
+[merge]
+deny_paths = ["playtest-results"]           # the harness writes JSON here; it must never reach main
+
+# `taskgraph stats` buckets tool time by the *first* tool call's command (SPEC §9). Configured
+# buckets are matched first, then the defaults (lease-wait, build, test, wait) still apply.
+[stats.buckets]
+playtest = 'playtest\.sh'
+art = 'tools/gen(audio|art)\.py'
