@@ -20,6 +20,9 @@ from typing import Any
 #: Values at or above this are epoch milliseconds, not seconds (~1973 in ms).
 _MS_THRESHOLD = 1e11
 
+#: ``type`` of the line omp writes when a tool call starts (SPEC §6/§9).
+TOOL_START = "tool_execution_start"
+
 
 @dataclass(frozen=True)
 class Call:
@@ -81,6 +84,30 @@ def epoch(value: Any) -> float | None:
             except ValueError:
                 return None
     return None
+
+
+def last_tool(path: Path | str) -> str | None:
+    """The tool of the most recent ``tool_execution_start``, or ``None`` (SPEC §9).
+
+    The idle-watch diagnosis names the call an agent is stuck on; a tool event
+    is the only record of it (the enclosing message may be a whole tool call
+    behind).  Only lines carrying the marker are parsed, so an agent echoing the
+    phrase in its own output cannot fake a tool name.
+    """
+    name: str | None = None
+    try:
+        handle = Path(path).open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with handle:
+        for line in handle:
+            if TOOL_START not in line:
+                continue
+            parsed = event(line)
+            if parsed is None or parsed.get("type") != TOOL_START:
+                continue
+            name = str(parsed.get("toolName") or "?")
+    return name
 
 
 def tool_command(args: Any) -> str | None:

@@ -27,7 +27,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from . import agent, assign, events, merge, metrics, order, plan, pool, state, worktree
+from . import agent, assign, events, idle, merge, metrics, order, plan, pool, state, worktree
 from .config import Config, ConfigError
 from .config import load as config_load
 
@@ -88,6 +88,7 @@ class Scheduler:
         self.merging: set[str] = set()
         self.forced: dict[str, str] = {}
         self._lease_anomalies: set[int] = set()
+        self.idle = idle.IdleWatch()
         self._results: list[merge.MergeResult] = []
         self._result_lock = threading.Lock()
         self.queue = merge.MergeQueue(cfg, on_result=self._merge_result)
@@ -176,6 +177,7 @@ class Scheduler:
         self._record_metrics(now)
         self._drain()
         self._watch(now)
+        self._idle_watch(now)
         if not self._stopping:
             self._fill(now)
         self._save()
@@ -275,6 +277,17 @@ class Scheduler:
             fallback = agent.fallback_model(record, self.cfg)
             if fallback is not None:
                 self._requeue(record, f"quota error; restart on {fallback.name}", force=fallback.name)
+
+    def _idle_watch(self, now: float) -> None:
+        """Report idle models and anomalous lease holders (SPEC §9)."""
+        self.idle.watch(
+            self.cfg.models,
+            self.running.values(),
+            self.history,
+            now,
+            self.state_root,
+            self._event,
+        )
 
     def _on_exit(self, record: agent.AgentRecord) -> None:
         """An agent process ended: merge when done, else retry or block (SPEC §8)."""

@@ -13,7 +13,18 @@ import sys
 from pathlib import Path
 from typing import Sequence, TextIO
 
-from . import assign, control, lease, leaseprocs, scheduler, state, stats, status, worktree
+from . import (
+    assign,
+    control,
+    lease,
+    leaseprocs,
+    models,
+    scheduler,
+    state,
+    stats,
+    status,
+    worktree,
+)
 from .config import Config, ConfigError, load
 from .procsig import (
     GROUP_GRACE,
@@ -231,6 +242,20 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_models(args: argparse.Namespace) -> int:
+    """``taskgraph models``: throughput per model by concurrency (SPEC §4)."""
+    config = _project_config("models")
+    if config is None:
+        return 2
+    try:
+        table = models.collect(config)
+    except state.StateError as exc:
+        print(f"taskgraph models: {exc}", file=sys.stderr)
+        return 2
+    print(models.render(table))
+    return 0
+
+
 def _cmd_leases(args: argparse.Namespace) -> int:
     """``taskgraph leases``: print current holders and their ages (SPEC §5)."""
     print(status.format_holders(lease.holders()))
@@ -309,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.choices["run"].set_defaults(func=_cmd_run)
     sub.choices["status"].set_defaults(func=_cmd_status)
     sub.choices["stats"].set_defaults(func=_cmd_stats)
+    sub.choices["models"].set_defaults(func=_cmd_models)
     sub.choices["lease"].set_defaults(func=_cmd_lease)
     sub.choices["leases"].set_defaults(func=_cmd_leases)
     sub.choices["stop"].set_defaults(func=_cmd_stop)

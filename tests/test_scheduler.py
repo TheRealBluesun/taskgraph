@@ -22,7 +22,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from taskgraph import agent, assign, cli, config, lease, scheduler, state, worktree
+from taskgraph import (
+    agent,
+    assign,
+    cli,
+    config,
+    lease,
+    leaseprocs,
+    metrics,
+    scheduler,
+    state,
+    trace,
+    worktree,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -60,6 +72,14 @@ retries = {retries}
 name = "m1"
 sessions = {sessions}
 max_agents = {max_agents}
+{metrics}
+"""
+
+
+IDLE_AGENT = """\
+#!/bin/sh
+echo '{"type":"tool_execution_start","toolCallId":"1","toolName":"bash"}'
+sleep "${FAKE_SLEEP:-60}"
 """
 
 
@@ -122,6 +142,7 @@ class ProjectTestCase(unittest.TestCase):
         resources="",
         command=None,
         worktrees="../wt",
+        metrics="",
     ):
         text = TOML.format(
             command=self.script if command is None else command,
@@ -132,6 +153,7 @@ class ProjectTestCase(unittest.TestCase):
             sessions=sessions,
             max_agents=sessions if max_agents is None else max_agents,
             worktrees=worktrees,
+            metrics=metrics,
         )
         path = self.root / "taskgraph.toml"
         path.write_text(text, encoding="utf-8")
@@ -351,6 +373,78 @@ class StallExemptTest(ProjectTestCase):
         self.assertFalse(agent.group_alive(record.pgid))
 
 
+class IdleWatchTest(ProjectTestCase):
+    """A model with agents but no requests is reported once, with a diagnosis (SPEC §9)."""
+
+    def test_idle_model_is_reported_once_with_a_diagnosis(self):
+        self.write_plan(PLAN_1)
+        script = self.base / "idle-agent.sh"
+        script.write_text(IDLE_AGENT, encoding="utf-8")
+        script.chmod(0o755)
+        cfg = self.load_cfg(
+            sessions=1,
+            max_agents=2,
+            stall_secs=3600,
+            command=script,
+            metrics='metrics = "http://127.0.0.1:1/metrics"',
+        )
+        clock = [time.time()]
+        sched = self.make_scheduler(
+            cfg, now=lambda: clock[0], sample=lambda url: metrics.Metrics(0.0, 0.0, 0.0)
+        )
+        sched.start()
+        sched.tick()  # starts T01; the zero-running clock starts on the next tick
+        record = sched.running["T01"]
+        # The agent's shell needs a moment to write its first trace line.
+        wait_until(lambda: trace.last_tool(record.log) == "bash", timeout=10)
+        for _ in range(12):  # > IDLE_SECS at the 20 s tick
+            clock[0] += 20.0
+            sched.tick()
+        agent.kill(record, timeout=5)
+
+        events = self.events_text()
+        self.assertEqual(events.count(" idle m1 "), 1)
+        line = next(line for line in events.splitlines() if " idle m1 " in line)
+        self.assertIn("agents T01 bash", line)
+        self.assertIn("ago", line)
+        self.assertIn("holders none", line)
+        self.assertIn("waiters none", line)
+
+
+class LeaseAnomalyTest(ProjectTestCase):
+    """A held lease that outlives 8 min or has no lease wrapper is an anomaly (SPEC §9)."""
+
+    def test_holder_that_never_announced_is_flagged_once(self):
+        cfg = self.load_cfg(sessions=1)
+        sched = self.make_scheduler(cfg, now=time.time, max_agents=0)
+        sched.start()
+        held = lease.try_acquire("sim", 1, root=self.state_root, task="T01")
+        self.addCleanup(lease.release, held, root=self.state_root)
+        sched.tick()
+        sched.tick()
+        events = self.events_text()
+        self.assertIn(f"slot-0 held by a non-lease process (pid {os.getpid()})", events)
+        self.assertEqual(events.count(" anomaly sim "), 1)
+
+    def test_lease_held_over_eight_minutes_is_flagged_once(self):
+        cfg = self.load_cfg(sessions=1)
+        clock = [time.time()]
+        sched = self.make_scheduler(cfg, now=lambda: clock[0], max_agents=0)
+        sched.start()
+        announcement = leaseprocs.register_process("sim", root=self.state_root, pid=os.getpid())
+        self.addCleanup(leaseprocs.unregister_process, announcement)
+        held = lease.try_acquire(
+            "sim", 1, root=self.state_root, task="T02", now=clock[0] - 600.0
+        )
+        self.addCleanup(lease.release, held, root=self.state_root)
+        sched.tick()
+        events = self.events_text()
+        self.assertIn("slot-0 held 10m00s by T02", events)
+        self.assertEqual(events.count(" anomaly sim "), 1)
+        sched.tick()
+        self.assertEqual(self.events_text().count(" anomaly sim "), 1)
+
+
 class ReloadTest(ProjectTestCase):
     def test_model_pool_reload_is_picked_up_and_logged(self):
         cfg = self.load_cfg(sessions=1)
@@ -398,6 +492,7 @@ class DryRunTest(unittest.TestCase):
                 sessions=1,
                 max_agents=1,
                 worktrees="../wt",
+                metrics="",
             ),
             encoding="utf-8",
         )

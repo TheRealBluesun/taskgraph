@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from . import leaseprocs, shims
+from . import leaseprocs, shims, trace
 from .config import Config, ModelConfig
 from .plan import Task
 from .prompt import PromptError, build_command, overlay_path, write_prompt
@@ -40,7 +40,7 @@ SIGKILL_GRACE = 5.0
 #: beginning matters: an agent that echoed this phrase later must not be killed.
 STARTUP_PHRASE = "Still starting after"
 STARTUP_LINES = 20
-TOOL_START_MARK = "tool_execution_start"
+TOOL_START_MARK = trace.TOOL_START
 
 #: Case-insensitive substrings that mark a rate-limit/quota error in the trace.
 QUOTA_MARKERS = ("rate limit", "rate_limit", "quota", "too many requests")
