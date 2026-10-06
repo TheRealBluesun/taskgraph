@@ -8,7 +8,7 @@ Do the FIRST unchecked task only. Each task: implement per SPEC.md, add/extend u
 - [x] T03 Plan parser + `mark_done` per SPEC §2 (`taskgraph/plan.py`); tests: tags, done/undone, ids with suffix letter, unrelated lines untouched by mark_done.
 - [x] T04 Ordering per SPEC §3 (`taskgraph/order.py`, pure): critical path, started-first callable, plan order, cycle safety; tests with a small graph where the critical-path task is last in plan order.
 - [x] T05 Metrics parsing per SPEC §4 (`taskgraph/metrics.py`): parse Prometheus text (running, waiting, generation_tokens_total; multiple series summed), `sample(url)` with urllib returning None on errors; tests on fixture text (no network).
-- [ ] T06 Model pool policy per SPEC §4 (`taskgraph/pool.py`, pure): `choose_model` incl. over-session rule, 180 s spacing, and the throughput-peak veto; table-driven tests.
+- [x] T06 Model pool policy per SPEC §4 (`taskgraph/pool.py`, pure): `choose_model` incl. over-session rule, 180 s spacing, and the throughput-peak veto; table-driven tests.
 - [ ] T07 Leases per SPEC §5 (`taskgraph/lease.py` + `taskgraph lease` / `taskgraph leases`): atomic slot files, stale detection (dead pid or non-lease process), waiting messages, signal forwarding, audit log; tests with capacity 1 and 2 using short `sleep` children and a temp TASKGRAPH_STATE.
 - [ ] T08 Deny shims per SPEC §5 (`taskgraph/shims.py`): create shims, real-binary resolution skipping the shim dir, allowed only with TASKGRAPH_LEASE; tests with a fake command in a temp dir.
 - [ ] T09 State file per SPEC §7 (`taskgraph/state.py`): atomic save/load, single-instance lock, process start-time check helper; tests incl. a stale lock from a dead pid.

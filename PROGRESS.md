@@ -38,3 +38,12 @@
 - `sample` uses `urllib.request.urlopen` and returns `None` on `OSError`/`ValueError`/`http.client.HTTPException` (covers `URLError`/`HTTPError`); a skipped sample is normal per SPEC §4.
 - No network in tests: `sample` is tested through `file://` URLs. Verified separately over loopback HTTP (200 → parsed) and a refused port (`None`) during development.
 - Next: T06 `choose_model` consumes `Metrics.running`/`.waiting` (and `assigned`, `now`, `last_extra`); T17's `models` table needs consecutive `generation_tokens` samples bucketed by `running`.
+
+## T06 — Model pool policy
+
+- Files: `taskgraph/pool.py`, `tests/test_pool.py` (23 new tests; suite now 87 tests, 0.09 s).
+- API: `choose_model(models, assigned, load, now, last_extra) -> name | None` (exact SPEC §4 signature), plus `Sample(at, metrics)`, `token_rates(samples) -> dict[bucket, list[float]]` and constants `MIN_SAMPLES=9`, `EXTRA_SPACING=180.0`, `MIN_BUCKET_SAMPLES=20`.
+- Two passes: every model's free *base* slot (`assigned < sessions`, config order) is offered before any over-session slot, so a later model's spare base slot beats an earlier model's extra slot. Over-session needs: `assigned < max_agents`, a `metrics` URL, ≥9 samples, mean `running` < `sessions-0.5` (strict), max `waiting` == 0, `now - last_extra[name] >= 180` (boundary allowed), and no throughput veto. Grant mutates `last_extra[name] = now` in place, after deciding.
+- `load` is `Mapping[name, Sequence[Sample]]` — samples carry a timestamp, because the veto needs `generation_tokens_total` deltas. `Sample.at` must share the clock with `now`/`last_extra`. `token_rates` sorts by `at`, files each interval's tokens/s under the *later* sample's `round(running)` bucket, and skips dt≤0 and counter resets. Veto fires when both buckets (sessions, sessions+1) have ≥20 rates and mean(sessions+1) < mean(sessions).
+- Both the slack gate and the veto read the same `load[name]` window: the scheduler must keep a window long enough to hold ≥20 rates in a busy bucket while still averaging below `sessions-0.5`, or the veto never fires (test builds a 180-sample history: bursts at concurrency 1 and 2 then an idle tail).
+- Next: T17 can reuse `token_rates` to print the per-bucket tokens/s table (peak bucket) for `taskgraph models`; T13 wires `assigned` from running records and records `Sample`s into scheduler state. No CLI change in T06.
