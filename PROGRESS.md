@@ -29,3 +29,12 @@
 - `started` is `Callable[[Task], int]`, lower = further along (0 notes+worktree, 1 worktree, 2 nothing); omitted → every task equal. Sort key is `(-chain, started_rank, plan_index)`, so plan order (dict insertion order) is only the final tie-break.
 - Chain = `1 + max(chain(pending dependents))`; done dependents are skipped, and a DFS back-edge (cycle) contributes 0 so `critical_paths` always terminates. Verified A1-last-in-plan wins over leaves, and A↔B cycles yield an empty `runnable`.
 - Next tasks: T05 metrics and T06 pool are independent. T13 (`run --dry-run`) should call `runnable` with a `started` callable built from worktree existence + `progress/<id>.md`; `blocked` ids come from scheduler state.
+
+## T05 — Metrics parsing
+
+- Files: `taskgraph/metrics.py`, `tests/test_metrics.py` (11 new tests; suite now 64 tests, 0.08 s).
+- API: `parse(text) -> Metrics` (frozen dataclass `running`, `waiting`, `generation_tokens`, all float, 0.0 defaults) and `sample(url, timeout=4) -> Metrics | None`; metric-name constants `RUNNING`/`WAITING`/`GENERATION_TOKENS`.
+- `parse` sums every series of the exact metric names (per-engine label sets), so `vllm:generation_tokens_total_created` and unrelated counters (e.g. `prompt_tokens_total`) do not leak in. Skips comments, blank lines, non-finite values (`NaN`/`Inf`) and unparseable lines rather than poisoning sums.
+- `sample` uses `urllib.request.urlopen` and returns `None` on `OSError`/`ValueError`/`http.client.HTTPException` (covers `URLError`/`HTTPError`); a skipped sample is normal per SPEC §4.
+- No network in tests: `sample` is tested through `file://` URLs. Verified separately over loopback HTTP (200 → parsed) and a refused port (`None`) during development.
+- Next: T06 `choose_model` consumes `Metrics.running`/`.waiting` (and `assigned`, `now`, `last_extra`); T17's `models` table needs consecutive `generation_tokens` samples bucketed by `running`.
