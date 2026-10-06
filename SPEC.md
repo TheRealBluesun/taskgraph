@@ -229,3 +229,29 @@ taskgraph retry <id>        # unblock a blocked task (resumes its worktree)
 ```
 
 `--dry-run` prints the ordered runnable list and the model each would get, then exits.
+
+
+## 11. Work and workers: the request router (user design, 2026-10-05)
+
+Work and workers are separate pools. **Work** = fungible units with priorities (plan tasks → agents, ordered by
+§3). **Workers** = model backends with capacity (e.g. .10 Flash × 1 long-context request, .15 27B × 2,
+DeepSeek × N overflow). An agent is NOT bound to a model: every agent talks to one OpenAI-compatible endpoint,
+`taskgraph router`, and each **generation request** is dispatched to the best worker with a free slot:
+
+1. **affinity** — the worker that served this agent's previous request, if it has a free slot (keeps the
+   server's prefix cache warm; a cold 60k-token prefill costs 30–60 s). Agent identity = `X-Taskgraph-Agent`
+   header if present, else a hash of the request's first system + first user message.
+2. else the **highest-priority** worker (config order) with a free slot;
+3. else wait in a FIFO queue (by task priority, then arrival) until any worker frees.
+
+Per worker: `upstream` URL, `model` (the router rewrites the request's `model` field), optional `api_key_env`
+(Authorization header injected from that env var — never logged), `concurrency` (slots), `max_context` (requests
+whose estimated prompt tokens — chars/3.5 — exceed it skip that worker), and `overflow = true` for paid workers,
+which also cap total spend via `max_requests_per_hour`. Request-level capacity is what protects a server (a
+second long-context request on .10 thrashes its KV cache); task-level agent counts only need to be high enough
+that workers stay busy (the scheduler raises the agent count while the router's queue is empty and any worker is
+idle, lowers it while requests wait > 30 s).
+
+`GET /router/stats`: per worker in_flight/queued/admitted/busy-seconds/utilization (last 10 min), affinity hit
+rate, per-agent worker switches. Model switching mid-task is allowed (all workers are capable coders); a task may
+pin a worker class with `[pin: local]` in the plan if switching hurts it.
