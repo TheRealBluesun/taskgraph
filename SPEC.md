@@ -85,6 +85,14 @@ the `[[models]]` section every tick when the file's mtime changes (log `pool …
 ("stop using .10 today", "allow 4 auxiliary agents") without a restart; agents already running keep their model,
 and a model over its new limit simply gets no new agents. `sessions = max_agents = 0` disables a model.
 
+**Job classes (later task).** Capacity is not one number: a model's KV cache may fit only one *long-context*
+coding agent but still have room for short jobs. Example (user, 2026-10-05): the .10 Flash server takes ONE
+long-context agent, plus at most one periodic short vision job (e.g. a screenshot critique), and nothing more. So
+`[[models]]` gets an optional `[models.classes]` table, e.g. `{ agent = 1, side = 1 }`; plan tasks default to class
+`agent`; side jobs (`taskgraph side <class> -- <cmd>`, e.g. a critic run) lease a model's `side` capacity and
+are preferred onto a model whose agent is currently blocked on a tool. Until that task lands, `sessions`/`max_agents`
+count `agent`-class only.
+
 Each running agent is assigned one model. `choose_model(models, assigned, load, now, last_extra) -> name | None`:
 
 - If a model has `assigned < sessions` → it is free (first in config order wins).
