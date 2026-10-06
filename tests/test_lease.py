@@ -1,84 +1,115 @@
 """Tests for the shared resource lease semaphore (SPEC §5).
 
 No network and no real user state: everything lives in a temp ``TASKGRAPH_STATE``.
-Contention and staleness against *live* holders use real ``taskgraph lease``
-subprocesses, because the staleness rule only trusts real lease processes.
+Ownership is an ``fcntl.flock`` on ``leases/<resource>/slot-<n>``, so lock
+mechanics are exercised in-process, while contention and lock release on death
+use real ``taskgraph lease`` subprocesses.
 """
 
-import json
+import fcntl
 import io
+import json
 import os
-import select
+import shlex
 import subprocess
 import sys
+import threading
 import unittest
 from pathlib import Path
 
-from leasehelpers import LeaseTestCase, wait_until
+from leasehelpers import ROOT, LeaseTestCase, wait_until
 
 from taskgraph import lease
 
+#: Eight real lease processes, driven through ``cli.run_lease`` with a short
+#: poll so the test does not pay the 2 s production poll for each hand-off.
+DRIVER = """\
+import sys
+sys.path.insert(0, {root!r})
+from taskgraph import cli
+raise SystemExit(cli.run_lease(sys.argv[1], sys.argv[4:], capacity=int(sys.argv[2]), poll=float(sys.argv[3])))
+"""
 
-class AcquireReleaseTest(LeaseTestCase):
+POLL = 0.05
+
+
+def guard_command(*dirs: Path) -> list[str]:
+    """A shell command failing with exit 9 if more than ``len(dirs)`` overlap.
+
+    Each concurrent run claims one guard directory and holds it for a moment, so
+    any breach of the lease capacity makes one of them exit non-zero.
+    """
+    quoted = [shlex.quote(str(d)) for d in dirs]
+    lines = []
+    for i, q in enumerate(quoted):
+        keyword = "if" if i == 0 else "elif"
+        lines.append(f"{keyword} mkdir {q} 2>/dev/null; then d={q};")
+    lines.append("else exit 9; fi")
+    return ["sh", "-c", " ".join(lines) + '; sleep 0.2; rmdir "$d"']
+
+
+class LayoutTest(LeaseTestCase):
     def test_state_root_from_env_and_default(self):
         self.assertEqual(lease.state_root({lease.ENV_STATE: "/tmp/x"}), Path("/tmp/x"))
         self.assertEqual(lease.state_root({}), Path("~/.taskgraph").expanduser())
 
-    def test_acquire_claims_lowest_slot_and_writes_fields(self):
-        slot = lease.try_acquire(
-            "simulator",
-            1,
-            root=self.state,
-            task="F03",
-            cmd=["xcodebuild", "-scheme", "App"],
-            alive=self.alive,
-        )
+    def test_slot_files_are_created_once_and_never_deleted(self):
+        slot = self.acquire_slot()
+        self.assertEqual(self.slot_names(), ["slot-0"])
+        self.release_slot(slot)
+        self.assertEqual(self.slot_names(), ["slot-0"])
+        self.assertEqual(lease.holders(self.state), [])
+
+
+class AcquireReleaseTest(LeaseTestCase):
+    def test_acquire_claims_lowest_slot_and_writes_info(self):
+        slot = self.acquire_slot(task="F03", cmd=["xcodebuild", "-scheme", "App"])
         self.assertIsNotNone(slot)
-        self.assertEqual((slot.n, slot.name), (0, "slot-0"))
+        self.assertEqual((slot.n, slot.name, slot.path.name), (0, "slot-0", "slot-0"))
         self.assertEqual(slot.pid, os.getpid())
-        self.assertEqual(slot.task, "F03")
         self.assertEqual(slot.cmd, "xcodebuild -scheme App")
-        self.assertTrue(slot.path.is_file())
+        self.assertIsNotNone(slot.fd)
         data = json.loads(slot.path.read_text())
         self.assertEqual(sorted(data), ["cmd", "cwd", "pid", "since", "task"])
         self.assertEqual(data["cmd"], "xcodebuild -scheme App")
+        self.assertEqual(data["task"], "F03")
 
     def test_capacity_one_second_acquire_is_denied(self):
-        self.assertIsNotNone(lease.try_acquire("simulator", 1, root=self.state, alive=self.alive))
-        self.assertIsNone(lease.try_acquire("simulator", 1, root=self.state, alive=self.alive))
-        self.assertEqual(self.slot_names(), ["slot-0.json"])
+        self.assertIsNotNone(self.acquire_slot())
+        self.assertIsNone(self.acquire_slot())
 
     def test_capacity_two_uses_two_slots_then_denies(self):
-        first = lease.try_acquire("simulator", 2, root=self.state, alive=self.alive)
-        second = lease.try_acquire("simulator", 2, root=self.state, alive=self.alive)
+        first = self.acquire_slot(capacity=2)
+        second = self.acquire_slot(capacity=2)
         self.assertEqual([first.n, second.n], [0, 1])
-        self.assertIsNone(lease.try_acquire("simulator", 2, root=self.state, alive=self.alive))
+        self.assertIsNone(self.acquire_slot(capacity=2))
 
     def test_release_frees_only_its_own_slot(self):
-        first = lease.try_acquire("simulator", 2, root=self.state, alive=self.alive)
-        second = lease.try_acquire("simulator", 2, root=self.state, alive=self.alive)
-        lease.release(first, root=self.state)
-        self.assertEqual(self.slot_names(), ["slot-1.json"])
-        again = lease.try_acquire("simulator", 2, root=self.state, alive=self.alive)
+        first = self.acquire_slot(capacity=2)
+        second = self.acquire_slot(capacity=2)
+        self.release_slot(first)
+        again = self.acquire_slot(capacity=2)
         self.assertEqual(again.n, 0)
-        lease.release(second, root=self.state)
-        lease.release(again, root=self.state)
-        self.assertEqual(self.slot_names(), [])
+        self.release_slot(second)
+        self.release_slot(again)
 
-    def test_release_leaves_a_reclaimed_slot_alone(self):
-        slot = lease.try_acquire("simulator", 1, root=self.state, alive=self.alive)
-        lease.release(slot, root=self.state)
-        other = lease.try_acquire(
-            "simulator", 1, root=self.state, alive=self.alive, pid=slot.pid + 1
+    def test_release_of_a_display_slot_is_a_no_op(self):
+        slot = lease.Slot(
+            resource="simulator",
+            n=0,
+            pid=1,
+            cmd="",
+            cwd="/w",
+            task=None,
+            since=0.0,
+            path=lease.resource_dir(self.state, "simulator") / "slot-0",
         )
-        lease.release(slot, root=self.state)  # stale handle from the first holder
-        self.assertTrue(other.path.is_file())
+        lease.release(slot, root=self.state)
+        self.assertEqual(self.audit_lines(), [])
 
     def test_audit_records_acquire_and_release(self):
-        slot = lease.try_acquire(
-            "simulator", 1, root=self.state, task="F03", cwd="/w", alive=self.alive
-        )
-        lease.release(slot, root=self.state)
+        slot = self.acquire_slot(task="F03", cwd="/w")
+        self.release_slot(slot)
         actions = [line.split()[1:4] for line in self.audit_lines()]
         self.assertEqual(
             actions, [["acquire", "simulator", "slot-0"], ["release", "simulator", "slot-0"]]
@@ -92,89 +123,64 @@ class AcquireReleaseTest(LeaseTestCase):
         with self.assertRaises(ValueError):
             lease.try_acquire("simulator", 0, root=self.state)
 
-    def test_unreadable_slot_still_blocks_the_index(self):
-        (lease.resource_dir(self.state, "simulator") / "slot-0.json").write_text("{truncated")
-        self.assertIsNone(lease.try_acquire("simulator", 1, root=self.state, alive=self.alive))
-        self.assertEqual(lease.read_slots(self.state, "simulator"), [])
 
+class FlockTest(LeaseTestCase):
+    def test_info_json_without_a_lock_is_not_a_holder(self):
+        self.write_slot("simulator", 0, pid=os.getpid(), task="crashed")
+        self.assertEqual(lease.holders(self.state), [])
+        slot = self.acquire_slot(task="fresh")
+        self.assertEqual(slot.n, 0)
+        self.assertEqual(json.loads(slot.path.read_text())["task"], "fresh")
 
-class StaleTest(LeaseTestCase):
-    def test_dead_pid_slot_is_removed_and_reacquired(self):
-        proc = subprocess.Popen([sys.executable, "-c", "pass"])
-        proc.wait(timeout=30)
-        self.write_slot("simulator", 0, pid=proc.pid, task="old")
-        slot = lease.try_acquire("simulator", 1, root=self.state)  # real ps check
+    def test_a_holder_that_wrote_no_json_still_blocks(self):
+        fd = self.hold_fd("simulator", 0)
+        try:
+            self.assertIsNone(self.acquire_slot())
+            held = lease.holders(self.state)
+            self.assertEqual([slot.name for slot in held], ["slot-0"])
+            self.assertEqual(held[0].pid, 0)  # no info was ever written
+        finally:
+            os.close(fd)
+        self.assertIsNotNone(self.acquire_slot())
+
+    def test_closing_the_fd_drops_the_lock(self):
+        path = lease.resource_dir(self.state, "simulator") / "slot-0"
+        fd = self.hold_fd("simulator", 0)
+        self.assertIsNone(self.acquire_slot())
+        os.close(fd)
+        slot = self.acquire_slot()
         self.assertIsNotNone(slot)
-        self.assertEqual(slot.pid, os.getpid())
-        self.assertEqual(
-            [line.split()[1] for line in self.audit_lines()], ["stale-removed", "acquire"]
+        self.assertEqual(slot.path, path)
+
+    def test_lock_is_cross_process_and_dropped_when_the_holder_is_killed(self):
+        path = lease.resource_dir(self.state, "simulator") / "slot-0"
+        marker = self.base / "locked"
+        script = (
+            "import fcntl, os, sys, time\n"
+            f"fd = os.open({str(path)!r}, os.O_RDWR | os.O_CREAT, 0o644)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            f"with open({str(marker)!r}, 'w') as fh:\n"
+            "    fh.write('locked')\n"
+            "time.sleep(30)\n"
         )
+        proc = subprocess.Popen([sys.executable, "-c", script])
 
-    def test_live_pid_that_is_not_a_lease_process_is_stale(self):
-        self.write_slot("simulator", 0, pid=os.getpid(), task="copycat")
-        removed = lease.remove_stale(self.state, "simulator")
-        self.assertEqual([slot.task for slot in removed], ["copycat"])
-        self.assertEqual(lease.read_slots(self.state, "simulator"), [])
+        def kill():
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
 
-    def test_is_stale_uses_injected_alive_check(self):
-        slot = lease.try_acquire("simulator", 1, root=self.state, alive=self.alive)
-        self.assertFalse(lease.is_stale(slot, alive=self.alive))
-        self.assertTrue(lease.is_stale(slot, alive=lambda pid: False))
-
-    def test_process_command_for_dead_and_live_pids(self):
-        proc = subprocess.Popen([sys.executable, "-c", "pass"])
-        proc.wait(timeout=30)
-        self.assertIsNone(lease.process_command(proc.pid))
-        self.assertIsNone(lease.process_command(0))
-        self.assertIsNotNone(lease.process_command(os.getpid()))
-
-    def test_looks_like_lease_command(self):
-        yes = [
-            "taskgraph lease simulator -- xcodebuild",
-            "/usr/bin/python3 /opt/taskgraph/bin/taskgraph lease simulator -- xcodebuild -x",
-            "python3 -m taskgraph.cli lease simulator -- true",
-            "/Users/x/taskgraph/bin/taskgraph lease simulator -- sleep 1",
-        ]
-        no = [
-            "taskgraph leases",
-            "python3 -m taskgraph.cli leases",
-            "/bin/sh -c ./dev.sh build",
-            "/bin/sleep 10",
-            "taskgraph run --project .",
-        ]
-        for cmd in yes:
-            with self.subTest(cmd=cmd):
-                self.assertTrue(lease.looks_like_lease_command(cmd))
-        for cmd in no:
-            with self.subTest(cmd=cmd):
-                self.assertFalse(lease.looks_like_lease_command(cmd))
+        self.addCleanup(kill)
+        self.assertTrue(wait_until(marker.exists), "child never locked the slot")
+        self.assertTrue(wait_until(lambda: lease.holders(self.state) != []))
+        self.assertIsNone(self.acquire_slot())
+        proc.kill()
+        proc.wait(timeout=10)
+        self.assertTrue(wait_until(lambda: lease.holders(self.state) == []), "kernel kept the lock")
+        self.assertIsNotNone(self.acquire_slot())
 
 
 class WaitForSlotTest(LeaseTestCase):
-    def test_removes_a_stale_slot_and_takes_its_place(self):
-        self.write_slot("simulator", 0, pid=os.getpid(), task="copycat")
-        slot = lease.wait_for_slot(
-            "simulator", 1, root=self.state, task="F03", poll=0.01, message_secs=0.01
-        )
-        self.assertIsNotNone(slot)
-        self.assertEqual((slot.n, slot.task), (0, "F03"))
-
-    def test_timeout_returns_none_and_prints_waiting_line(self):
-        self.write_slot("simulator", 0, pid=os.getpid(), task="F03")
-        stream = io.StringIO()
-        slot = lease.wait_for_slot(
-            "simulator",
-            1,
-            root=self.state,
-            task="T07",
-            poll=0.02,
-            out=stream,
-            timeout=0.15,
-            alive=self.alive,
-        )
-        self.assertIsNone(slot)
-        self.assertIn("waiting for simulator (held by F03 for 0 s)", stream.getvalue())
-
     def test_wait_message_names_the_task_and_age(self):
         def slot(**kw):
             fields = dict(
@@ -185,7 +191,7 @@ class WaitForSlotTest(LeaseTestCase):
                 cwd="/w",
                 task="F03",
                 since=1000.0,
-                path=Path("/tmp/slot-0.json"),
+                path=Path("/tmp/slot-0"),
             )
             fields.update(kw)
             return lease.Slot(**fields)
@@ -213,44 +219,84 @@ class WaitForSlotTest(LeaseTestCase):
                 cwd="/w",
                 task=task,
                 since=since,
-                path=Path(f"/tmp/slot-{n}.json"),
+                path=Path(f"/tmp/slot-{n}"),
             )
 
-        message = lease.wait_message("simulator", [slot(1, 900.0, "old"), slot(0, 990.0, "new")], now=1000.0)
+        message = lease.wait_message(
+            "simulator", [slot(1, 900.0, "old"), slot(0, 990.0, "new")], now=1000.0
+        )
         self.assertEqual(message, "waiting for simulator (held by old for 100 s)")
 
-    def test_holders_lists_only_live_slots(self):
-        live = lease.try_acquire("simulator", 2, root=self.state, alive=self.alive, pid=os.getpid())
-        self.write_slot("simulator", 1, pid=os.getpid() + 1, task="copycat")
+    def test_timeout_returns_none_and_prints_waiting_line(self):
+        holder = self.acquire_slot(task="F03")
+        stream = io.StringIO()
+        slot = lease.wait_for_slot(
+            "simulator", 1, root=self.state, task="T07", poll=0.02, out=stream, timeout=0.2
+        )
+        self.assertIsNone(slot)
+        self.assertIn("waiting for simulator (held by F03 for 0 s)", stream.getvalue())
+        self.assertEqual(self.held_names(), ["slot-0"])
+        self.release_slot(holder)
 
-        def alive_check(pid: int) -> bool:
-            return pid == os.getpid()
-
-        names = [slot.name for slot in lease.holders(self.state, alive=alive_check)]
-        self.assertEqual(names, ["slot-0"])
-        self.assertEqual(lease.holders(self.state, alive=lambda pid: False), [])
-        self.assertTrue(live.path.is_file())
+    def test_waits_until_the_holder_releases(self):
+        holder = self.acquire_slot(task="F03")
+        threading.Timer(0.15, self.release_slot, args=(holder,)).start()
+        slot = lease.wait_for_slot(
+            "simulator",
+            1,
+            root=self.state,
+            task="T07",
+            poll=0.02,
+            out=io.StringIO(),
+            timeout=5,
+        )
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.task, "T07")
+        self.release_slot(slot)
 
 
 class ContentionTest(LeaseTestCase):
-    def test_second_holder_waits_for_capacity_one(self):
-        project = self.project()
-        first = self.spawn_lease(project, "simulator", "--", "sleep", "30")
-        self.assertTrue(wait_until(lambda: self.slot_names() == ["slot-0.json"]), "first holds")
-        second = self.spawn_lease(project, "simulator", "--", "sleep", "30")
-        self.assertTrue(wait_until(lambda: self.slot_names() == ["slot-0.json"]))
-        # The waiting line is printed before the first 2 s poll; wait for that
-        # write instead of a fixed sleep (startup stretches under load).
-        self.assertTrue(
-            wait_until(lambda: bool(select.select([second.stderr], [], [], 0)[0])),
-            "second lease wrote no message",
+    def spawn_driver(self, capacity: int, cmd: list[str]) -> subprocess.Popen:
+        """Start a real lease process running ``cmd`` under ``capacity`` slots."""
+        driver = self.base / "drive.py"
+        if not driver.exists():
+            driver.write_text(DRIVER.format(root=str(ROOT)))
+        proc = subprocess.Popen(
+            [sys.executable, "-u", str(driver), "simulator", str(capacity), str(POLL), *cmd],
+            cwd=str(self.base),
+            env=self.env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        second.terminate()  # no child yet: default SIGTERM disposition applies
-        second.wait(timeout=10)
-        self.assertIn("waiting for simulator (held by ? for", second.stderr.read())
-        first.terminate()
-        first.wait(timeout=10)
-        self.assertTrue(wait_until(lambda: self.slot_names() == []), "slot released")
+
+        def kill():
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+        self.addCleanup(kill)
+        return proc
+
+    def run_eight(self, capacity: int, *dirs: Path):
+        """Run 8 concurrent leases of one guard command; return (code, stderr)."""
+        procs = [self.spawn_driver(capacity, guard_command(*dirs)) for _ in range(8)]
+        results = []
+        for proc in procs:
+            code = proc.wait(timeout=60)
+            results.append((code, proc.stderr.read()))
+            proc.stderr.close()
+        return results
+
+    def test_capacity_one_is_never_exceeded_by_eight_leases(self):
+        results = self.run_eight(1, self.base / "guard-1")
+        self.assertEqual([code for code, _ in results], [0] * 8, results)
+        self.assertEqual(self.max_concurrent(), 1)
+
+    def test_capacity_two_is_never_exceeded_by_eight_leases(self):
+        results = self.run_eight(2, self.base / "guard-a", self.base / "guard-b")
+        self.assertEqual([code for code, _ in results], [0] * 8, results)
+        self.assertLessEqual(self.max_concurrent(), 2)
 
 
 if __name__ == "__main__":

@@ -1,28 +1,33 @@
 """Shared resource leases (SPEC §5): one counting semaphore per resource.
 
 Agents run in separate worktrees and may outlive a scheduler restart, so the
-lock cannot live in process memory.  Each held slot is the file
-``leases/<resource>/slot-<n>.json``, claimed with ``O_CREAT|O_EXCL`` so two
-waiters can never win the same slot.
+semaphore cannot live in process memory.  Each slot is the file
+``leases/<resource>/slot-<n>`` (``n < capacity``), created on first use and
+never deleted.  A slot is *held* iff some process holds
+``fcntl.flock(fd, LOCK_EX | LOCK_NB)`` on it: the lease process takes the lock,
+truncates and writes ``{pid, cmd, cwd, task, since}`` into the file (status and
+audit only — never used to decide ownership), keeps the fd open for the whole
+lease and releases by closing it.  The kernel drops the lock the instant the
+holder exits, crashes or is killed, so there is no stale state to detect and no
+pid/``ps`` guessing (SPEC §5).
 
-A slot is stale when its pid is dead, or alive but not a ``taskgraph lease``
-process (that is also how a reused pid is caught); any waiter may remove it.
-The holder is *always* a ``taskgraph lease`` process — see :func:`taskgraph.cli.run`
-for the wrapper that takes a slot, runs the command with ``TASKGRAPH_LEASE`` set,
-and releases it.  All paths come from ``$TASKGRAPH_STATE`` (default
-``~/.taskgraph``), never from a project dir, so agents cannot rewrite the
-machinery (SPEC §5).
+Waiters try each slot's lock in turn every ``POLL_SECS``.  ``taskgraph leases``
+probes the same locks: a slot whose lock it can take is free, so it closes it
+again and reports only the slots that stayed locked.
+
+All paths come from ``$TASKGRAPH_STATE`` (default ``~/.taskgraph``), never from
+a project dir, so agents cannot rewrite the machinery (SPEC §5).
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
-import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Sequence, TextIO
 
@@ -32,11 +37,8 @@ DEFAULT_STATE_DIR = "~/.taskgraph"
 
 POLL_SECS = 2.0
 MESSAGE_SECS = 30.0
-PS_TIMEOUT = 5.0
 
-_SLOT_FILE = re.compile(r"^slot-(\d+)\.json$")
-# A holder's command line looks like `/usr/bin/python3 .../bin/taskgraph lease …`.
-_LEASE_CMD = re.compile(r"(?:^|[\s/])taskgraph(?:\.cli)?\s.*\blease\b")
+_SLOT_FILE = re.compile(r"^slot-(\d+)$")
 
 
 class LeaseError(Exception):
@@ -45,7 +47,11 @@ class LeaseError(Exception):
 
 @dataclass(frozen=True)
 class Slot:
-    """One held lease slot, mirroring its ``slot-<n>.json`` file."""
+    """One lease slot: its ``slot-<n>`` file plus the info JSON written there.
+
+    ``fd`` is the lock-holding descriptor and is set only on slots returned by
+    :func:`try_acquire`; slots probed back for display carry ``fd = None``.
+    """
 
     resource: str
     n: int
@@ -55,6 +61,7 @@ class Slot:
     task: str | None
     since: float
     path: Path
+    fd: int | None = field(default=None, compare=False, repr=False)
 
     @property
     def name(self) -> str:
@@ -94,57 +101,11 @@ def _root(root: Path | str | None) -> Path:
     return Path(root) if root is not None else state_root()
 
 
-# ------------------------------------------------------------------- process checks
-
-
-def process_command(pid: int) -> str | None:
-    """Return ``ps -o lstart=,command=`` for ``pid``, or ``None`` if it is gone.
-
-    ``None`` also covers ``ps`` being unavailable or timing out: an unreadable
-    holder must never look alive.
-    """
-    if pid <= 0:
-        return None
-    try:
-        proc = subprocess.run(
-            ["ps", "-o", "lstart=,command=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=PS_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    line = proc.stdout.strip()
-    return line or None
-
-
-def looks_like_lease_command(cmd: str) -> bool:
-    """Whether ``cmd`` (a process command line) is a ``taskgraph lease`` call."""
-    return bool(_LEASE_CMD.search(cmd))
-
-
-def pid_is_live_lease(pid: int) -> bool:
-    """Whether ``pid`` is a live ``taskgraph lease`` process (any project)."""
-    cmd = process_command(pid)
-    return cmd is not None and looks_like_lease_command(cmd)
-
-
-def is_stale(slot: Slot, *, alive: Callable[[int], bool] = pid_is_live_lease) -> bool:
-    """Whether ``slot``'s holder is dead, or its pid now belongs to something else."""
-    return not alive(slot.pid)
-
-
 # ------------------------------------------------------------------------- slots
 
 
 def slot_files(root: Path | str | None, resource: str) -> list[tuple[int, Path]]:
-    """Existing slot files of ``resource`` as ``(n, path)``, sorted by ``n``.
-
-    Filenames count as taken even when their JSON is unreadable or still being
-    written, so a half-written slot is never handed out twice.
-    """
+    """Existing slot files of ``resource`` as ``(n, path)``, sorted by ``n``."""
     found: list[tuple[int, Path]] = []
     try:
         entries = list(resource_dir(root, resource).iterdir())
@@ -157,56 +118,76 @@ def slot_files(root: Path | str | None, resource: str) -> list[tuple[int, Path]]
     return sorted(found)
 
 
-def read_slots(root: Path | str | None, resource: str) -> list[Slot]:
-    """Parse the readable slots of ``resource``, sorted by slot number."""
-    slots: list[Slot] = []
-    for n, path in slot_files(root, resource):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        try:
-            task = data.get("task")
-            slots.append(
-                Slot(
-                    resource=resource,
-                    n=n,
-                    pid=int(data.get("pid", 0)),
-                    cmd=str(data.get("cmd", "")),
-                    cwd=str(data.get("cwd", "")),
-                    task=str(task) if task is not None else None,
-                    since=float(data.get("since", 0.0)),
-                    path=path,
-                )
-            )
-        except (TypeError, ValueError):
-            continue
-    return slots
-
-
-def remove_stale(
-    root: Path | str | None,
-    resource: str,
-    *,
-    alive: Callable[[int], bool] = pid_is_live_lease,
+def holders(
+    root: Path | str | None = None, *, resource: str | None = None
 ) -> list[Slot]:
-    """Delete stale slots of ``resource`` and audit each removal."""
+    """Slots currently held, ordered by resource then slot number.
+
+    Ownership is probed, not read: a slot whose ``flock`` can be taken is free,
+    so it is closed again and skipped (SPEC §5).  ``resource`` limits the scan
+    to one resource instead of every directory under ``leases/``.
+    """
     base = _root(root)
-    removed: list[Slot] = []
-    for slot in read_slots(base, resource):
-        if not is_stale(slot, alive=alive):
-            continue
+    if resource is None:
         try:
-            slot.path.unlink()
-        except FileNotFoundError:
-            pass
+            resources = sorted(
+                entry.name for entry in leases_root(base).iterdir() if entry.is_dir()
+            )
         except OSError:
-            continue
-        audit(base, "stale-removed", slot)
-        removed.append(slot)
-    return removed
+            return []
+    else:
+        resources = [resource]
+    live: list[Slot] = []
+    for name in resources:
+        for n, path in slot_files(base, name):
+            held = _held_slot(name, n, path)
+            if held is not None:
+                live.append(held)
+    return live
+
+
+def _held_slot(resource: str, n: int, path: Path) -> Slot | None:
+    """Return ``path``'s slot info if its lock is taken, else ``None``."""
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return _read_slot(resource, n, path)
+    os.close(fd)
+    return None
+
+
+def _read_slot(resource: str, n: int, path: Path) -> Slot:
+    """Best-effort parse of a slot's info JSON; unknown fields stay empty."""
+    data: dict = {}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            data = parsed
+    except (OSError, ValueError):
+        pass
+    try:
+        pid = int(data.get("pid", 0))
+    except (TypeError, ValueError):
+        pid = 0
+    try:
+        since = float(data.get("since", 0.0))
+    except (TypeError, ValueError):
+        since = 0.0
+    task = data.get("task")
+    return Slot(
+        resource=resource,
+        n=n,
+        pid=pid,
+        cmd=str(data.get("cmd", "")),
+        cwd=str(data.get("cwd", "")),
+        task=str(task) if task is not None else None,
+        since=since,
+        path=path,
+    )
 
 
 def try_acquire(
@@ -218,26 +199,34 @@ def try_acquire(
     cmd: Sequence[str] | str = (),
     cwd: str | None = None,
     now: float | None = None,
-    alive: Callable[[int], bool] = pid_is_live_lease,
     pid: int | None = None,
 ) -> Slot | None:
     """Claim a free slot of ``resource``, or return ``None`` when all are held.
 
-    Stale slots are cleared first (SPEC §5: any waiter may do this), then the
-    lowest-numbered free index below ``capacity`` is claimed atomically.
+    Tries each slot below ``capacity`` in turn: open it (creating it once, if
+    needed) and take its lock without blocking.  The returned slot holds that
+    lock until :func:`release` closes its fd.
     """
     if capacity < 1:
         raise ValueError(f"capacity must be >= 1, got {capacity}")
     base = _root(root)
     directory = resource_dir(base, resource)
-    directory.mkdir(parents=True, exist_ok=True)
-    remove_stale(base, resource, alive=alive)
-    used = {n for n, _ in slot_files(base, resource)}
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise LeaseError(f"{directory}: cannot create lease dir: {exc}") from exc
     payload_cmd = cmd if isinstance(cmd, str) else " ".join(cmd)
     for n in range(capacity):
-        if n in used:
+        path = directory / f"slot-{n}"
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as exc:
+            raise LeaseError(f"{path}: cannot open slot: {exc}") from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
             continue
-        path = directory / f"slot-{n}.json"
         slot = Slot(
             resource=resource,
             n=n,
@@ -247,60 +236,49 @@ def try_acquire(
             task=task,
             since=time.time() if now is None else now,
             path=path,
+            fd=fd,
         )
-        data = {
-            "pid": slot.pid,
-            "cmd": slot.cmd,
-            "cwd": slot.cwd,
-            "task": slot.task,
-            "since": slot.since,
-        }
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise LeaseError(f"{path}: cannot create slot: {exc}") from exc
-        try:
-            os.write(fd, json.dumps(data, sort_keys=True).encode("utf-8"))
-        finally:
-            os.close(fd)
+        _write_info(slot)
         audit(base, "acquire", slot)
         return slot
     return None
 
 
-def release(slot: Slot, *, root: Path | str | None = None) -> None:
-    """Release ``slot``; a no-op if a waiter already removed and re-claimed it."""
-    base = _root(root if root is not None else slot.path.parents[1])
+def _write_info(slot: Slot) -> None:
+    """Truncate ``slot``'s file and write its info JSON (best effort)."""
+    data = {
+        "pid": slot.pid,
+        "cmd": slot.cmd,
+        "cwd": slot.cwd,
+        "task": slot.task,
+        "since": slot.since,
+    }
+    payload = json.dumps(data, sort_keys=True).encode("utf-8")
     try:
-        data = json.loads(slot.path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = None
-    if isinstance(data, dict) and data.get("pid") != slot.pid:
-        return
-    try:
-        slot.path.unlink()
-    except FileNotFoundError:
+        os.lseek(slot.fd, 0, os.SEEK_SET)
+        os.ftruncate(slot.fd, 0)
+        written = 0
+        while written < len(payload):
+            written += os.write(slot.fd, payload[written:])
+    except OSError:
         pass
-    except OSError:
+
+
+def release(slot: Slot, *, root: Path | str | None = None) -> None:
+    """Release ``slot`` by closing its lock fd (SPEC §5).
+
+    A slot read back for display has ``fd = None`` and is left alone.  The
+    audit line is written *before* the close so the log can never show a new
+    holder's ``acquire`` before the previous holder's ``release``.
+    """
+    if slot.fd is None:
         return
+    base = _root(root) if root is not None else slot.path.parents[1].parent
     audit(base, "release", slot)
-
-
-def holders(
-    root: Path | str | None = None, *, alive: Callable[[int], bool] = pid_is_live_lease
-) -> list[Slot]:
-    """Live slots of every resource, ordered by resource then slot number."""
-    base = leases_root(_root(root))
     try:
-        resources = sorted(entry.name for entry in base.iterdir() if entry.is_dir())
+        os.close(slot.fd)
     except OSError:
-        return []
-    live: list[Slot] = []
-    for resource in resources:
-        live.extend(s for s in read_slots(base.parent, resource) if not is_stale(s, alive=alive))
-    return live
+        pass
 
 
 # ------------------------------------------------------------------------- audit
@@ -351,23 +329,21 @@ def wait_for_slot(
     message_secs: float | None = MESSAGE_SECS,
     out: TextIO | None = None,
     timeout: float | None = None,
-    alive: Callable[[int], bool] = pid_is_live_lease,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> Slot | None:
     """Wait for a free slot of ``resource``, or ``None`` after ``timeout``.
 
     Prints ``waiting for <resource> (held by <task> for <n> s)`` on entering the
-    wait and then at most every ``message_secs`` (SPEC §5).
+    wait and then at most every ``message_secs`` (SPEC §5).  Slots are retried
+    every ``poll`` seconds.
     """
     stream = sys.stderr if out is None else out
     base = _root(root)
     started = clock()
     last_message: float | None = None
     while True:
-        slot = try_acquire(
-            resource, capacity, root=base, task=task, cmd=cmd, cwd=cwd, alive=alive
-        )
+        slot = try_acquire(resource, capacity, root=base, task=task, cmd=cmd, cwd=cwd)
         if slot is not None:
             return slot
         if timeout is not None and clock() - started >= timeout:
@@ -376,10 +352,9 @@ def wait_for_slot(
             last_message is None or clock() - last_message >= message_secs
         ):
             print(
-                wait_message(resource, read_slots(base, resource)),
+                wait_message(resource, holders(base, resource=resource)),
                 file=stream,
                 flush=True,
             )
             last_message = clock()
         sleep(poll)
-

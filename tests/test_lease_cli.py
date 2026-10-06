@@ -6,15 +6,15 @@ the config lookup and the rendered holders table.
 """
 
 import io
-import json
 import os
 import select
+import signal
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 
-from leasehelpers import BIN, MINIMAL_TOML, ROOT, LeaseTestCase, wait_until
+from leasehelpers import BIN, MINIMAL_TOML, LeaseTestCase, wait_until
 
 from taskgraph import cli, lease
 
@@ -29,7 +29,7 @@ class FormattingTest(unittest.TestCase):
             cwd="/w",
             task="F03",
             since=1000.0,
-            path=Path("/tmp/slot-0.json"),
+            path=Path("/tmp/slot-0"),
         )
         fields.update(kw)
         return lease.Slot(**fields)
@@ -53,7 +53,8 @@ class RunLeaseTest(LeaseTestCase):
     def test_returns_child_exit_code_and_releases(self):
         code = cli.run_lease("simulator", ["/bin/sh", "-c", "exit 7"], capacity=1, root=self.state)
         self.assertEqual(code, 7)
-        self.assertEqual(self.slot_names(), [])
+        self.assertEqual(self.held_names(), [])
+        self.assertEqual(self.slot_names(), ["slot-0"])  # never deleted
         self.assertEqual([line.split()[1] for line in self.audit_lines()], ["acquire", "release"])
 
     def test_exports_lease_env_to_the_child(self):
@@ -72,12 +73,13 @@ class RunLeaseTest(LeaseTestCase):
             "simulator", ["/nonexistent/prog"], capacity=1, root=self.state, out=io.StringIO()
         )
         self.assertEqual(code, 127)
-        self.assertEqual(self.slot_names(), [])
+        self.assertEqual(self.held_names(), [])
+        self.assertEqual(self.slot_names(), ["slot-0"])
 
     def test_times_out_on_a_held_slot(self):
         project = self.project()
         holder = self.spawn_lease(project, "simulator", "--task", "F03", "--", "sleep", "30")
-        self.assertTrue(wait_until(lambda: self.slot_names() == ["slot-0.json"]), "holder acquired")
+        self.assertTrue(wait_until(lambda: self.held_names() == ["slot-0"]), "holder acquired")
         stream = io.StringIO()
         code = cli.run_lease(
             "simulator",
@@ -90,7 +92,7 @@ class RunLeaseTest(LeaseTestCase):
         )
         self.assertEqual(code, cli.TIMEOUT_EXIT)
         self.assertIn("waiting for simulator (held by F03", stream.getvalue())
-        self.assertEqual(self.slot_names(), ["slot-0.json"])  # the holder keeps it
+        self.assertEqual(self.held_names(), ["slot-0"])  # the holder keeps it
 
 
 class CliTest(LeaseTestCase):
@@ -110,7 +112,8 @@ class CliTest(LeaseTestCase):
             project, "lease", "simulator", "--task", "T07", "--", "/bin/sh", "-c", "exit 3"
         )
         self.assertEqual(proc.returncode, 3, proc.stderr)
-        self.assertEqual(self.slot_names(), [])
+        self.assertEqual(self.held_names(), [])
+        self.assertEqual(self.slot_names(), ["slot-0"])
         self.assertIn("T07", self.audit_lines()[-1])
 
     def test_lease_accepts_task_flag_before_and_after_the_resource(self):
@@ -154,22 +157,22 @@ class CliTest(LeaseTestCase):
         project = self.project(MINIMAL_TOML.replace("simulator = 1", "simulator = 2"))
         first = self.spawn_lease(project, "simulator", "--", "sleep", "30")
         second = self.spawn_lease(project, "simulator", "--", "sleep", "30")
-        self.assertTrue(wait_until(lambda: self.slot_names() == ["slot-0.json", "slot-1.json"]))
+        self.assertTrue(wait_until(lambda: self.held_names() == ["slot-0", "slot-1"]))
         third = self.spawn_lease(project, "simulator", "--", "sleep", "30")
-        self.assertTrue(wait_until(lambda: "slot-2.json" not in self.slot_names()))
         # The first waiting line is printed before the first 2 s poll; wait for
         # that write rather than a fixed sleep (startup stretches under load).
         self.assertTrue(
             wait_until(lambda: bool(select.select([third.stderr], [], [], 0)[0])),
             "waiting lease wrote no message",
         )
+        self.assertEqual(self.held_names(), ["slot-0", "slot-1"])
         third.terminate()
         third.wait(timeout=10)
         self.assertIn("waiting for simulator", third.stderr.read())
         for proc in (first, second):
             proc.terminate()
             proc.wait(timeout=10)
-        self.assertTrue(wait_until(lambda: self.slot_names() == []))
+        self.assertTrue(wait_until(lambda: self.held_names() == []))
 
     def group_members(self, pgid: int) -> list:
         """Pids in process group ``pgid`` (portable across macOS/Linux pgrep flags)."""
@@ -203,13 +206,13 @@ class CliTest(LeaseTestCase):
         holder.terminate()
         self.assertEqual(holder.wait(timeout=10), 128 + 15)
         self.assertTrue(wait_until(lambda: self.group_members(pgid) == []), "grandchild stopped")
-        self.assertTrue(wait_until(lambda: self.slot_names() == []), "slot released")
+        self.assertTrue(wait_until(lambda: self.held_names() == []), "slot released")
 
     def test_leases_listing_shows_a_live_holder_then_nothing(self):
         project = self.project()
         holder = self.spawn_lease(project, "simulator", "--task", "F03", "--", "sleep", "30")
         try:
-            self.assertTrue(wait_until(lambda: self.slot_names() == ["slot-0.json"]), "acquired")
+            self.assertTrue(wait_until(lambda: self.held_names() == ["slot-0"]), "acquired")
             listed = self.cli(project, "leases")
             self.assertEqual(listed.returncode, 0, listed.stderr)
             self.assertIn("simulator", listed.stdout)
@@ -219,9 +222,68 @@ class CliTest(LeaseTestCase):
             holder.terminate()
             holder.wait(timeout=10)
         self.assertEqual(holder.returncode, 128 + 15)  # forwarded SIGTERM reaches the child
-        self.assertTrue(wait_until(lambda: self.slot_names() == []), "released")
+        self.assertTrue(wait_until(lambda: self.held_names() == []), "released")
         empty = self.cli(project, "leases")
         self.assertEqual(empty.stdout.strip(), "no leases held")
+
+
+class SignalTest(LeaseTestCase):
+    """A lease process dying by any means frees its slot (SPEC §5)."""
+
+    def child_pgid(self, pidfile: Path) -> int:
+        try:
+            return int(pidfile.read_text().strip())
+        except (OSError, ValueError):
+            return 0
+
+    def holder(self, project: Path, tag: str) -> subprocess.Popen:
+        """Start a lease whose child writes its pgid, and wait until it holds."""
+        pidfile = self.base / f"{tag}.pid"
+        proc = self.spawn_lease(
+            project,
+            "simulator",
+            "--task",
+            "F03",
+            "--",
+            "sh",
+            "-c",
+            f"echo $$ > {pidfile}; sleep 30",
+        )
+
+        def kill_group():
+            pgid = self.child_pgid(pidfile)
+            if pgid > 0:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+        self.addCleanup(kill_group)
+        self.assertTrue(wait_until(lambda: self.child_pgid(pidfile) > 0), "child started")
+        self.assertTrue(wait_until(lambda: self.held_names() == ["slot-0"]), "slot held")
+        return proc
+
+    def assert_released(self):
+        self.assertTrue(wait_until(lambda: self.held_names() == []), "slot freed")
+        self.assertIsNotNone(self.acquire_slot())
+
+    def test_sigterm_frees_the_slot(self):
+        proc = self.holder(self.project(), "term")
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=10), 128 + 15)
+        self.assert_released()
+
+    def test_sigint_frees_the_slot(self):
+        proc = self.holder(self.project(), "int")
+        os.kill(proc.pid, signal.SIGINT)
+        proc.wait(timeout=10)
+        self.assert_released()
+
+    def test_sigkill_frees_the_slot(self):
+        proc = self.holder(self.project(), "kill")
+        proc.kill()
+        proc.wait(timeout=10)
+        self.assert_released()
 
 
 if __name__ == "__main__":
