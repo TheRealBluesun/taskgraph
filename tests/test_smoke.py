@@ -4,6 +4,7 @@ import contextlib
 import io
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -18,9 +19,9 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(taskgraph.__version__, "0.1.0")
 
     def test_remaining_subcommands_parse_and_stub(self):
-        # `lease` and `leases` are implemented (T07); the rest still report the stub.
+        # `lease`/`leases` are implemented (T07), `run` in T13; the rest stub.
         for name in cli.SUBCOMMANDS:
-            if name in {"lease", "leases"}:
+            if name in {"lease", "leases", "run"}:
                 continue
             with self.subTest(command=name):
                 argv = [name]
@@ -33,11 +34,12 @@ class SmokeTest(unittest.TestCase):
                 self.assertEqual(err.getvalue().strip(), f"taskgraph {name}: not implemented")
 
     def test_run_flags_parse(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()) as out:
-            rc = cli.main(["run", "--project", "/tmp/x", "--max-agents", "2", "--dry-run"])
-        self.assertEqual(rc, 1)
-        self.assertIn("not implemented", err.getvalue())
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = cli.main(["run", "--project", tmp, "--max-agents", "2", "--dry-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn(cli.CONFIG_NAME, err.getvalue())
 
     def test_no_command_prints_help(self):
         out = io.StringIO()

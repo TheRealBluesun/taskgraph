@@ -129,7 +129,7 @@ def _commit_work(cfg: Config, tid: str, worktree_path: Path) -> MergeResult | No
     predecessor tool.  A git failure is reported, not raised, so the worktree
     survives for ``taskgraph retry``.
     """
-    worktree.exclude(cfg, worktree_path, "logs/")
+    worktree.exclude(worktree_path, "logs/")
     added = _run(cfg, "add", "-A", cwd=worktree_path)
     if added.returncode != 0:
         detail = _tail(added.stderr or added.stdout, 1)

@@ -22,6 +22,7 @@ from __future__ import annotations
 import statistics
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from .config import ModelConfig
 from .metrics import Metrics
@@ -64,6 +65,35 @@ class Sample:
 
     at: float
     metrics: Metrics
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for scheduler state (SPEC §7)."""
+        m = self.metrics
+        return {
+            "at": self.at,
+            "metrics": {
+                "running": m.running,
+                "waiting": m.waiting,
+                "generation_tokens": m.generation_tokens,
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Sample | None":
+        """Rebuild a sample from state; ``None`` when the entry is malformed."""
+        try:
+            at = float(data["at"])
+            raw = data.get("metrics") or {}
+            return cls(
+                at,
+                Metrics(
+                    float(raw.get("running", 0.0)),
+                    float(raw.get("waiting", 0.0)),
+                    float(raw.get("generation_tokens", 0.0)),
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
 
 def choose_model(

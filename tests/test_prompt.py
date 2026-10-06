@@ -1,11 +1,20 @@
 """Tests for the agent prompt file and command template (SPEC §6)."""
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-from taskgraph import prompt
+from taskgraph import prompt, worktree
 from agenthelpers import PROJECT_PROMPT, make_config, make_task
+
+
+def git(*args, cwd):
+    """Run ``git args`` in ``cwd`` and fail the test if it does not succeed."""
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result
 
 
 class PromptTextTest(unittest.TestCase):
@@ -142,58 +151,56 @@ class WritePromptTest(unittest.TestCase):
 
 
 class ExcludeTest(unittest.TestCase):
+    """The prompt file must be excluded in the file git actually reads (SPEC §6).
+
+    ``git add -A`` in the merge step (SPEC §8) would otherwise commit every
+    worktree's prompt file, and two worktrees adding the same path with
+    different contents would conflict on rebase.
+    """
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)
+        self.repo = self.base / "repo"
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", ".", cwd=self.repo)
+        git("config", "user.email", "t@example.invalid", cwd=self.repo)
+        git("config", "user.name", "Test", cwd=self.repo)
+        (self.repo / "README.md").write_text("hi\n", encoding="utf-8")
+        git("add", "-A", cwd=self.repo)
+        git("commit", "-qm", "init", cwd=self.repo)
 
-    def test_excludes_the_prompt_file_in_a_plain_repo(self):
-        worktree = self.base / "repo"
-        (worktree / ".git" / "info").mkdir(parents=True)
-        self.assertTrue(prompt.exclude(".taskgraph-prompt.md", worktree))
-        exclude = worktree / ".git" / "info" / "exclude"
-        self.assertEqual(exclude.read_text(encoding="utf-8"), ".taskgraph-prompt.md\n")
-        # Re-running adds nothing (idempotent) and keeps existing entries.
-        self.assertFalse(prompt.exclude(".taskgraph-prompt.md", worktree))
-        self.assertEqual(exclude.read_text(encoding="utf-8"), ".taskgraph-prompt.md\n")
+    def staged(self, cwd):
+        return git("diff", "--cached", "--name-only", cwd=cwd).stdout.splitlines()
+
+    def test_plain_repo_excludes_a_pattern_git_honours(self):
+        self.assertTrue(prompt.exclude(".taskgraph-prompt.md", self.repo))
+        self.assertFalse(prompt.exclude(".taskgraph-prompt.md", self.repo))  # idempotent
+        (self.repo / ".taskgraph-prompt.md").write_text("x\n", encoding="utf-8")
+        git("add", "-A", cwd=self.repo)
+        self.assertNotIn(".taskgraph-prompt.md", self.staged(self.repo))
 
     def test_keeps_existing_entries_and_terminates_the_file(self):
-        worktree = self.base / "repo"
-        info = worktree / ".git" / "info"
-        info.mkdir(parents=True)
-        (info / "exclude").write_text("*.log", encoding="utf-8")
-        self.assertTrue(prompt.exclude(".taskgraph-prompt.md", worktree))
-        self.assertEqual(
-            (info / "exclude").read_text(encoding="utf-8"), "*.log\n.taskgraph-prompt.md\n"
-        )
+        path = worktree.exclude_file(self.repo)
+        path.write_text("*.log", encoding="utf-8")
+        self.assertTrue(prompt.exclude(".taskgraph-prompt.md", self.repo))
+        self.assertEqual(path.read_text(encoding="utf-8"), "*.log\n.taskgraph-prompt.md\n")
 
-    def test_linked_worktree_gitdir_file_is_followed(self):
-        # A linked worktree's .git is a file: "gitdir: <main>/.git/worktrees/<name>".
-        worktree = self.base / "wt"
-        worktree.mkdir()
-        real = self.base / "main" / ".git" / "worktrees" / "wt"
-        real.mkdir(parents=True)
-        (worktree / ".git").write_text(f"gitdir: {real}\n", encoding="utf-8")
-        self.assertTrue(prompt.exclude(".taskgraph-prompt.md", worktree))
-        self.assertTrue((real / "info" / "exclude").is_file())
+    def test_linked_worktree_excludes_where_git_reads(self):
+        linked = self.base / "wt"
+        git("worktree", "add", "-b", "task/W", str(linked), cwd=self.repo)
+        self.assertTrue(prompt.exclude(".taskgraph-prompt.md", linked))
+        exclude = worktree.exclude_file(linked)
+        self.assertIn(".taskgraph-prompt.md", exclude.read_text(encoding="utf-8"))
+        (linked / ".taskgraph-prompt.md").write_text("x\n", encoding="utf-8")
+        git("add", "-A", cwd=linked)
+        self.assertNotIn(".taskgraph-prompt.md", self.staged(linked))
 
     def test_no_git_metadata_is_not_an_error(self):
-        worktree = self.base / "plain"
-        worktree.mkdir()
-        self.assertFalse(prompt.exclude(".taskgraph-prompt.md", worktree))
-        self.assertFalse((worktree / ".git").exists())
-
-
-class GitDirTest(unittest.TestCase):
-    def test_missing_git_reports_none(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertIsNone(prompt.git_dir(tmp))
-
-    def test_relative_gitdir_line_still_parses(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            worktree = Path(tmp)
-            (worktree / ".git").write_text("gitdir: ../real\n", encoding="utf-8")
-            self.assertEqual(prompt.git_dir(worktree), (worktree / "../real").resolve())
+        plain = self.base / "plain"
+        plain.mkdir()
+        self.assertFalse(prompt.exclude(".taskgraph-prompt.md", plain))
 
 
 if __name__ == "__main__":  # pragma: no cover

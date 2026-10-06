@@ -17,6 +17,8 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from . import worktree as worktree_mod
+
 PROMPT_NAME = ".taskgraph-prompt.md"
 SHARE_DIRNAME = "share"
 
@@ -124,46 +126,14 @@ def write_prompt(
     return path
 
 
-def git_dir(worktree: Path | str) -> Path | None:
-    """Return ``worktree``'s git directory, or ``None`` outside a repository.
-
-    A linked worktree has a ``.git`` *file* holding ``gitdir: …/.git/worktrees/
-    <name>`` instead of a directory; both shapes are handled.
-    """
-    dot = Path(worktree) / ".git"
-    if dot.is_dir():
-        return dot
-    if not dot.is_file():
-        return None
-    try:
-        text = dot.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    for line in text.splitlines():
-        if line.startswith("gitdir:"):
-            target = Path(line[len("gitdir:") :].strip())
-            return target if target.is_absolute() else (Path(worktree) / target).resolve()
-    return None
-
-
 def exclude(pattern: str, worktree: Path | str) -> bool:
-    """Add ``pattern`` to the worktree's ``.git/info/exclude``; True if added.
+    """Add ``pattern`` to the exclude file git reads for ``worktree`` (SPEC §6).
 
-    A worktree without git metadata (or an unwritable exclude file) is not an
-    error here — the file simply stays untracked-by-convention.
+    ``git rev-parse --git-path info/exclude`` names the file git actually reads
+    (for a linked worktree: the clone's shared ``.git/info/exclude``); writing a
+    per-worktree ``info/exclude`` would be ignored, so the prompt file would be
+    staged by the merge step's ``git add -A``.  A worktree without git metadata
+    (or an unwritable file) is not an error here.
     """
-    directory = git_dir(worktree)
-    if directory is None:
-        return False
-    try:
-        info = directory / "info"
-        info.mkdir(parents=True, exist_ok=True)
-        path = info / "exclude"
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        if pattern in existing.splitlines():
-            return False
-        text = existing if not existing or existing.endswith("\n") else existing + "\n"
-        path.write_text(text + pattern + "\n", encoding="utf-8")
-    except OSError:
-        return False
-    return True
+    path = worktree_mod.exclude_file(worktree)
+    return False if path is None else worktree_mod.add_exclude(path, pattern)

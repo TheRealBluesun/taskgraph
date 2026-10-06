@@ -66,6 +66,15 @@ def notes_path(cfg: Config, tid: str) -> Path:
     return path(cfg, tid) / PROGRESS_DIRNAME / f"{tid}.md"
 
 
+def done_path(cfg: Config, tid: str) -> Path:
+    """Return the path of ``tid``'s completion marker (``progress/<id>.done``).
+
+    Its presence is what tells the scheduler an agent finished and the task may
+    enter the merge queue (SPEC §6/§8).
+    """
+    return path(cfg, tid) / PROGRESS_DIRNAME / f"{tid}.done"
+
+
 def started_rank(cfg: Config, tid: str) -> int:
     """Rank how far along ``tid`` already is, for SPEC §3's "started first".
 
@@ -127,27 +136,42 @@ def link_files(cfg: Config, worktree: Path | str) -> list[Path]:
             os.symlink(os.path.abspath(source), target)
         except OSError as exc:
             raise WorktreeError(f"{target}: cannot link {rel}: {exc.strerror or exc}") from exc
-        exclude(cfg, worktree, rel)
+        exclude(worktree, rel)
         created.append(target)
     return created
 
 
-def exclude(cfg: Config, worktree: Path | str, pattern: str) -> bool:
-    """Add ``pattern`` to the clone's local exclude file; True if newly added.
+def exclude_file(worktree: Path | str) -> Path | None:
+    """Return the exclude file git actually reads for ``worktree``, or ``None``.
 
-    The merge step stages everything with ``git add -A`` (SPEC §8), so a
-    symlinked secret that the project did not gitignore would land in the merge
-    commit (and a later merge into the project root could refuse to overwrite
-    the real file).  ``.git/info/exclude`` is local to the clone, never
-    committed, and is the same place SPEC §6 keeps the prompt file.  A worktree
-    without git metadata, or an unwritable file, is not an error here.
+    ``git rev-parse --git-path info/exclude`` resolves a linked worktree to the
+    **shared** ``<repo>/.git/info/exclude`` — the file git really reads, and the
+    one SPEC §6/§8 mean; a per-worktree ``worktrees/<name>/info/exclude`` is
+    ignored by git.  A worktree without git metadata reports ``None``.
     """
-    result = _run(cfg, "rev-parse", "--git-path", "info/exclude", cwd=worktree)
-    if result.returncode != 0:
-        return False
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", "info/exclude"],
+            cwd=os.fspath(worktree),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
     path = Path(result.stdout.strip())
-    if not path.is_absolute():
-        path = Path(worktree) / path
+    return path if path.is_absolute() else Path(worktree) / path
+
+
+def add_exclude(path: Path | str, pattern: str) -> bool:
+    """Append ``pattern`` to an exclude file; True if it was newly added.
+
+    Idempotent and newline-safe; an unwritable file is not an error (the caller
+    simply does not get the exclusion).
+    """
+    path = Path(path)
     try:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
         if pattern in existing.splitlines():
@@ -158,6 +182,17 @@ def exclude(cfg: Config, worktree: Path | str, pattern: str) -> bool:
     except OSError:
         return False
     return True
+
+
+def exclude(worktree: Path | str, pattern: str) -> bool:
+    """Add ``pattern`` to the exclude file git reads for ``worktree`` (SPEC §6/§8).
+
+    The merge step stages everything with ``git add -A``, so a symlinked secret
+    or the prompt file would otherwise land in the merge commit.  ``None`` from
+    :func:`exclude_file` (no git metadata) reports ``False``.
+    """
+    path = exclude_file(worktree)
+    return False if path is None else add_exclude(path, pattern)
 
 
 def remove(cfg: Config, tid: str) -> None:

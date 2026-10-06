@@ -6,13 +6,14 @@ network; every started group is killed on cleanup.
 """
 
 import os
+import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from taskgraph import agent, prompt
+from taskgraph import agent, prompt, worktree
 from taskgraph.config import ModelConfig
 from agenthelpers import AgentTestCase, make_config, make_task, wait_for
 
@@ -35,14 +36,18 @@ class StartTest(AgentTestCase):
         self.assertEqual(agent.poll(record), "running")
 
     def test_prompt_file_is_written_git_excluded_and_passed_to_the_agent(self):
-        (self.worktree / ".git" / "info").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", "."], cwd=self.worktree, check=True)
         script = self.script('echo "arg1=$1"')
         record = self.launch(f"{script} {{prompt_file}}")
         prompt_path = self.worktree / prompt.PROMPT_NAME
         self.assertEqual(prompt_path, self.worktree / ".taskgraph-prompt.md")
         self.assertIn("YOUR TASK IS **T01**", prompt_path.read_text(encoding="utf-8"))
-        exclude = (self.worktree / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+        exclude = worktree.exclude_file(self.worktree).read_text(encoding="utf-8")
         self.assertIn(prompt.PROMPT_NAME, exclude)
+        ignored = subprocess.run(
+            ["git", "check-ignore", "-q", prompt.PROMPT_NAME], cwd=self.worktree
+        )
+        self.assertEqual(ignored.returncode, 0)  # git itself ignores the prompt file
         self.wait_log(record, f"arg1={prompt_path}")
 
     def test_poll_reports_exited_after_a_short_agent_finishes(self):

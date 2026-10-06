@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Sequence, TextIO
 
-from . import lease
+from . import assign, lease, scheduler
 from .config import ConfigError, load
 from .procsig import (
     GROUP_GRACE,
@@ -183,6 +183,34 @@ def run_lease(
     return code if code >= 0 else 128 - code
 
 
+def _cmd_run(args: argparse.Namespace) -> int:
+    """``taskgraph run``: start/resume the scheduler, or print the plan (SPEC §10)."""
+    if args.project:
+        config_path = Path(args.project) / CONFIG_NAME
+        if not config_path.is_file():
+            print(f"taskgraph run: no {CONFIG_NAME} in {args.project}", file=sys.stderr)
+            return 2
+    else:
+        config_path = find_config()
+        if config_path is None:
+            print(
+                f"taskgraph run: no {CONFIG_NAME} found in this directory or its parents",
+                file=sys.stderr,
+            )
+            return 2
+    try:
+        config = load(config_path)
+    except ConfigError as exc:
+        print(f"taskgraph run: {exc}", file=sys.stderr)
+        return 2
+    if args.dry_run:
+        print(assign.dry_run(config, max_agents=args.max_agents))
+        return 0
+    return scheduler.Scheduler(
+        config, max_agents=args.max_agents, tick_secs=scheduler.env_tick_secs()
+    ).run()
+
+
 def _cmd_lease(args: argparse.Namespace) -> int:
     """``taskgraph lease``: wait for a resource slot, then run the command (SPEC §5)."""
     if not args.cmd:
@@ -228,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in SUBCOMMANDS:
         sp = sub.add_parser(name, help=SUBCOMMANDS[name])
         sp.set_defaults(command=name, func=_not_implemented)
+    sub.choices["run"].set_defaults(func=_cmd_run)
     sub.choices["lease"].set_defaults(func=_cmd_lease)
     sub.choices["leases"].set_defaults(func=_cmd_leases)
 
