@@ -22,5 +22,6 @@ Implemented by omp (ralph loop); planned and reviewed with Claude.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017nt17ajhN2xY9pBawuHqhz"
+  git push -q origin main 2>/dev/null || echo "$(date +%T) (push failed — will retry next task)"
   echo "$(date +%T) --- merged $task ($(git log -1 --format=%h))"
 done
