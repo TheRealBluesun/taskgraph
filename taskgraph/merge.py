@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from . import guard
 from . import plan as plan_mod
 from . import worktree
 from .config import Config
@@ -75,16 +76,21 @@ def merge(cfg: Config, tid: str) -> MergeResult:
     """Merge task ``tid``'s worktree into the integration branch (SPEC §8).
 
     Runs in the calling thread; :class:`MergeQueue` supplies the single worker.
-    Returns a blocked :class:`MergeResult` for the expected failures (conflict,
-    gate failure, main moving repeatedly) and keeps the worktree so ``taskgraph
-    retry`` can resume it.  Raises :class:`MergeError` only when a step cannot
-    run at all.
+    Returns a blocked :class:`MergeResult` for the expected failures (a failed
+    work commit, the commit guard, conflict, gate failure, main moving
+    repeatedly) and keeps the worktree so ``taskgraph retry`` can resume it.
+    Raises :class:`MergeError` only when a step cannot run at all.
     """
     worktree_path = worktree.path(cfg, tid)
     if not worktree_path.is_dir():
         raise MergeError(f"{worktree_path}: no worktree for {tid} to merge")
 
-    _commit_work(cfg, tid, worktree_path)
+    blocked = _commit_work(cfg, tid, worktree_path)
+    if blocked is not None:
+        return blocked
+    blocked = _guard(cfg, tid, worktree_path)
+    if blocked is not None:
+        return blocked
 
     attempts = 0
     while True:
@@ -114,11 +120,76 @@ def merge(cfg: Config, tid: str) -> MergeResult:
 # --------------------------------------------------------------------------- steps
 
 
-def _commit_work(cfg: Config, tid: str, worktree_path: Path) -> None:
-    """Step 1: stage everything but ``logs`` and commit it (SPEC §8)."""
-    _git(cfg, "add", "-A", "--", ".", ":!logs", cwd=worktree_path)
-    if _staged(cfg, worktree_path):
-        _git(cfg, "commit", "-q", "-m", WORK_COMMIT.format(id=tid), cwd=worktree_path)
+def _commit_work(cfg: Config, tid: str, worktree_path: Path) -> MergeResult | None:
+    """Step 1: stage everything and commit it; a blocked result on git failure.
+
+    ``logs`` is kept out via the clone's local exclude file, not a ``:!logs``
+    pathspec: naming a path git ignores makes ``git add`` exit non-zero ("The
+    following paths are ignored…"), which silently skipped every commit in the
+    predecessor tool.  A git failure is reported, not raised, so the worktree
+    survives for ``taskgraph retry``.
+    """
+    worktree.exclude(cfg, worktree_path, "logs/")
+    added = _run(cfg, "add", "-A", cwd=worktree_path)
+    if added.returncode != 0:
+        detail = _tail(added.stderr or added.stdout, 1)
+        return MergeResult(tid, False, f"git add -A failed: {detail}")
+    if not _staged(cfg, worktree_path):
+        return None
+    commit = _run(cfg, "commit", "-q", "-m", WORK_COMMIT.format(id=tid), cwd=worktree_path)
+    if commit.returncode != 0:
+        detail = _tail(commit.stderr or commit.stdout, 1)
+        return MergeResult(tid, False, f"git commit failed: {detail}")
+    return None
+
+
+def _guard(cfg: Config, tid: str, worktree_path: Path) -> MergeResult | None:
+    """Block a task branch that is a build dump (SPEC §8 commit guard).
+
+    Inspects everything the branch adds over ``cfg.main``, not just the newest
+    commit: a blocked task keeps its earlier commit, so a retry that adds
+    nothing must still be checked against the whole branch.
+    """
+    added, sizes = _changed(cfg, worktree_path)
+    issues = guard.problems(
+        added,
+        sizes,
+        max_files=cfg.merge.max_files,
+        max_file_mb=cfg.merge.max_file_mb,
+        deny_dirs=cfg.merge.deny_dirs,
+    )
+    return None if not issues else MergeResult(
+        tid, False, "commit guard: " + "; ".join(issues)
+    )
+
+
+def _changed(cfg: Config, worktree_path: Path) -> tuple[list[str], dict[str, int]]:
+    """Return the added paths and present-path byte sizes over ``cfg.main``.
+
+    The work commit was just made from this worktree, so on-disk sizes match
+    it; a path that vanished (deleted, broken link) is skipped, never guessed.
+    """
+    result = _run(
+        cfg, "diff", "--name-status", "--no-renames", f"{cfg.main}...HEAD", cwd=worktree_path
+    )
+    if result.returncode != 0:
+        return [], {}
+    added: list[str] = []
+    sizes: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2 or not fields[0].strip():
+            continue
+        status, path = fields[0][:1], fields[-1]
+        if status not in ("A", "M", "R", "C", "T"):
+            continue  # a deletion is not a size or path offence
+        if status == "A":
+            added.append(path)
+        try:
+            sizes[path] = os.lstat(worktree_path / path).st_size
+        except OSError:
+            continue
+    return added, sizes
 
 
 def _rebase(cfg: Config, tid: str, worktree_path: Path, attempts: int) -> MergeResult | None:

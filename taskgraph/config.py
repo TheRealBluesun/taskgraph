@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .guard import DEFAULT_DENY_PATHS, DEFAULT_MAX_FILE_MB, DEFAULT_MAX_FILES
+
 # Defaults for keys SPEC §1 shows in the example but does not require.
 DEFAULT_OVERLAY = "omp-agent.yml"
 DEFAULT_STALL_SECS = 480.0
@@ -50,6 +52,20 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class MergeConfig:
+    """The ``[merge]`` table: limits for the work-commit guard (SPEC §8)."""
+
+    max_files: int = DEFAULT_MAX_FILES
+    max_file_mb: float = DEFAULT_MAX_FILE_MB
+    deny_paths: tuple[str, ...] = ()
+
+    @property
+    def deny_dirs(self) -> tuple[str, ...]:
+        """Build/output directories that block a merge (defaults + configured)."""
+        return DEFAULT_DENY_PATHS + self.deny_paths
+
+
+@dataclass(frozen=True)
 class Config:
     """A validated ``taskgraph.toml``."""
 
@@ -64,6 +80,7 @@ class Config:
     agent: AgentConfig
     models: tuple[ModelConfig, ...]
     trailer: tuple[str, ...] = ()
+    merge: MergeConfig = MergeConfig()
 
     @property
     def root(self) -> Path:
@@ -114,6 +131,7 @@ def _build(data: Mapping[str, Any], path: Path) -> Config:
         agent=_agent(data.get("agent"), path),
         models=_models(data.get("models"), path),
         trailer=_string_list(data, "trailer", path, where="", default=()),
+        merge=_merge(data.get("merge"), path),
     )
 
 
@@ -196,6 +214,23 @@ def _models(raw: Any, path: Path) -> tuple[ModelConfig, ...]:
                 f"{path}: model '{model.name}' has unknown fallback '{model.fallback}'"
             )
     return tuple(models)
+
+
+def _merge(raw: Any, path: Path) -> MergeConfig:
+    """Validate the optional ``[merge]`` table (SPEC §8 commit guard)."""
+    if raw is None:
+        return MergeConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: [merge] must be a table")
+    max_files = _int(raw, "max_files", path, where="[merge] ", default=DEFAULT_MAX_FILES, minimum=1)
+    max_file_mb = _number(raw, "max_file_mb", path, where="[merge] ", default=DEFAULT_MAX_FILE_MB)
+    if max_file_mb <= 0:
+        raise ConfigError(f"{path}: [merge] 'max_file_mb' must be > 0, not {max_file_mb!r}")
+    return MergeConfig(
+        max_files=max_files,
+        max_file_mb=max_file_mb,
+        deny_paths=_string_list(raw, "deny_paths", path, where="[merge] ", default=()),
+    )
 
 
 def _string(

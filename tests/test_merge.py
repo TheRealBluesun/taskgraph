@@ -9,11 +9,12 @@ network, no omp, nothing outside the temp dir.
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from taskgraph import merge, worktree
-from taskgraph.config import AgentConfig, Config, ModelConfig
+from taskgraph.config import AgentConfig, Config, MergeConfig, ModelConfig
 
 INITIAL_PLAN = "- [ ] T01 first task\n- [x] T00 done\n"
 INITIAL_PROGRESS = "# Progress\n\n"
@@ -28,7 +29,7 @@ def git(*args, cwd):
     return result
 
 
-def make_config(root, gate="true", trailer=()):
+def make_config(root, gate="true", trailer=(), merge_config=None):
     """Build a :class:`Config` rooted at ``root`` (no I/O)."""
     return Config(
         path=Path(root) / "taskgraph.toml",
@@ -42,6 +43,7 @@ def make_config(root, gate="true", trailer=()):
         agent=AgentConfig(command="true"),
         models=(ModelConfig(name="m1", sessions=1, max_agents=1),),
         trailer=tuple(trailer),
+        merge=merge_config or MergeConfig(),
     )
 
 
@@ -131,6 +133,27 @@ class MergeSuccessTest(MergeTestCase):
         self.assertFalse(worktree.exists(cfg, "T01"))
 
 
+class GitignoredLogsTest(MergeTestCase):
+    """Regression: naming a gitignored path made ``git add`` (and the commit) fail."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / ".gitignore").write_text("logs/\n", encoding="utf-8")
+        git("add", "-A", cwd=self.root)
+        git("commit", "-qm", "ignore logs", cwd=self.root)
+
+    def test_stages_and_commits_when_the_project_ignores_logs(self):
+        cfg, wt = self.start()
+        result = merge.merge(cfg, "T01")
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.attempts, 1)
+        self.assertTrue((self.root / "work.txt").is_file())
+        self.assertFalse((self.root / "logs").exists())
+        self.assertIn("- [x] T01", (self.root / "PLAN.md").read_text(encoding="utf-8"))
+        self.assertFalse(wt.exists())
+
+
 class NoWorktreeTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -203,6 +226,69 @@ class MergeBlockTest(MergeTestCase):
         self.assertEqual(result.attempts, merge.MAX_ATTEMPTS)
         self.assertIn("main moved 3 times", result.reason)
         self.assertTrue(wt.is_dir())
+
+
+class CommitGuardTest(MergeTestCase):
+    def fill(self, wt, kind):
+        """Put one guard offence of ``kind`` into worktree ``wt``."""
+        if kind == "many":
+            (wt / "gen").mkdir()
+            for i in range(201):
+                (wt / "gen" / f"f{i}.txt").write_text("x\n", encoding="utf-8")
+        elif kind == "big":
+            (wt / "big.bin").write_bytes(b"\0" * (6 * 1024 * 1024))
+        else:
+            (wt / ".build").mkdir()
+            (wt / ".build" / "x.o").write_text("obj\n", encoding="utf-8")
+
+    def test_each_limit_blocks_and_keeps_the_worktree(self):
+        cfg = self.config()
+        cases = {
+            "T01": ("many", "adds 201 files (limit 200)", "gen/f0.txt"),
+            "T02": ("big", "files over 5 MB", "big.bin (6.0 MB)"),
+            "T03": ("build", "paths under build/output dirs", ".build/x.o"),
+        }
+        for tid, (kind, message, path) in cases.items():
+            with self.subTest(kind=kind):
+                wt = worktree.create(cfg, tid)
+                self.fill(wt, kind)
+
+                result = merge.merge(cfg, tid)
+
+                self.assertFalse(result.ok)
+                self.assertIn("commit guard", result.reason)
+                self.assertIn(message, result.reason)
+                self.assertIn(path, result.reason)
+                self.assertTrue(wt.is_dir())  # kept, so retry can fix and resume it
+                self.assertTrue(self.branch_exists(worktree.branch(tid)))
+
+    def test_uses_the_limits_from_config(self):
+        cfg, wt = self.start()
+
+        strict = merge.merge(replace(cfg, merge=MergeConfig(max_files=2)), "T01")
+        self.assertFalse(strict.ok)
+        self.assertIn("limit 2", strict.reason)
+        self.assertTrue(wt.is_dir())
+
+        # The very same commit passes once the limits are back to the defaults.
+        again = merge.merge(cfg, "T01")
+        self.assertTrue(again.ok, again.reason)
+
+
+class FailedCommitTest(MergeTestCase):
+    def test_a_failing_commit_blocks_with_git_stderr_and_keeps_the_worktree(self):
+        cfg, wt = self.start()
+        hook = self.root / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho 'hook: nope' >&2\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+
+        result = merge.merge(cfg, "T01")
+
+        self.assertFalse(result.ok)
+        self.assertIn("git commit failed", result.reason)
+        self.assertIn("hook: nope", result.reason)
+        self.assertTrue(wt.is_dir())
+        self.assertTrue(self.branch_exists("task/T01"))
 
 
 class QueueTest(unittest.TestCase):

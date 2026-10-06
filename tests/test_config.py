@@ -5,7 +5,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from taskgraph.config import AgentConfig, Config, ConfigError, ModelConfig, load
+from taskgraph.config import AgentConfig, Config, ConfigError, MergeConfig, ModelConfig, load
 
 # The example config from SPEC §1, verbatim (comments stripped).
 SPEC_TOML = """
@@ -137,6 +137,43 @@ fallback = "m1"
 """
         )
         self.assertEqual(cfg.models[1].fallback, "m1")
+
+
+class MergeConfigTest(ConfigTestBase):
+    def test_defaults(self):
+        cfg = self.load_text(MINIMAL_TOML)
+        self.assertEqual(cfg.merge, MergeConfig())
+        self.assertEqual(cfg.merge.max_files, 200)
+        self.assertEqual(cfg.merge.max_file_mb, 5.0)
+        for entry in ("build/", ".build/", "DerivedData/", "node_modules/", "target/", "dist/"):
+            self.assertIn(entry, cfg.merge.deny_dirs)
+
+    def test_merge_table_is_parsed(self):
+        toml = MINIMAL_TOML + '\n[merge]\nmax_files = 12\nmax_file_mb = 1.5\ndeny_paths = ["vendor/"]\n'
+        cfg = self.load_text(toml)
+        self.assertEqual(cfg.merge.max_files, 12)
+        self.assertEqual(cfg.merge.max_file_mb, 1.5)
+        self.assertEqual(cfg.merge.deny_paths, ("vendor/",))
+        self.assertIn("vendor/", cfg.merge.deny_dirs)
+        self.assertIn("build/", cfg.merge.deny_dirs)  # the defaults still apply
+
+    def test_max_files_must_be_positive(self):
+        self.assert_error(MINIMAL_TOML + "\n[merge]\nmax_files = 0\n", "[merge] max_files' must be >= 1")
+
+    def test_max_file_mb_must_be_positive(self):
+        self.assert_error(MINIMAL_TOML + "\n[merge]\nmax_file_mb = 0\n", "[merge] 'max_file_mb' must be > 0")
+
+    def test_deny_paths_must_be_an_array_of_strings(self):
+        self.assert_error(
+            MINIMAL_TOML + '\n[merge]\ndeny_paths = "vendor"\n',
+            "[merge] deny_paths' must be an array of non-empty strings",
+        )
+
+    def test_merge_must_be_a_table(self):
+        self.assert_error(
+            MINIMAL_TOML.replace('main = "main"', 'main = "main"\nmerge = 3'),
+            "[merge] must be a table",
+        )
 
 
 class ModelCapacityTest(ConfigTestBase):
