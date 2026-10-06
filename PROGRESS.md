@@ -13,3 +13,11 @@
 - Defaults where SPEC §1's example has a key but does not require it: `links=()`, `resources={}`, `agent.overlay="omp-agent.yml"`, `agent.stall_secs=480.0` (stored as float), `agent.retries=2`, `agent.deny=()`, `model.max_agents=sessions`, `model.fallback=None`.
 - Validation: required root keys `plan/prompt/gate/worktrees/main`, required `[agent].command`, non-empty `[[models]]` with unique names and `sessions >= 1`; errors are `"<path>: <key> must be …"` naming the key (nested keys prefixed `[agent] ` / `[[models]][i] `). Extra keys are ignored. `max_agents < sessions`, capacity `< 1`, duplicate model names, and a `fallback` that names no configured model are errors — all of these would otherwise silently disable the over-session pool rule or the quota fallback (§4/§6).
 - Next tasks: `stats.buckets` (SPEC §9) is *not* parsed yet — T16 must add it; T10 uses `model.fallback`; T11/T13 resolve `plan`/`prompt`/`worktrees` against `config.root`.
+
+## T03 — Plan parser
+
+- Files: `taskgraph/plan.py`, `tests/test_plan.py` (16 tests; suite now 38 tests, 0.07 s).
+- API: `parse(text) -> dict[id, Task]` (dict insertion order = plan order) and `mark_done(text, tid) -> str`; `PlanError` on unknown id. `Task` = frozen dataclass `id, text, done, deps, res`.
+- Line pattern `^[ \t]*[-*][ \t]+\[[ xX]\][ \t]+<id>(<rest>)?[ \t]*$` with id `[A-Z]+[0-9]+[a-z]?`; every other line (including lowercase ids, prose, unchecked non-list lines) is ignored. `[deps: A, B]` / `[res: A, B]` are stripped from `text` (tags are metadata, not prompt content), split on commas, blanks dropped. `res` is a tuple for symmetry with `deps` even though SPEC calls it display-only (nothing consumes it yet; T13/T15 may display it).
+- `mark_done` edits only the matched line by replacing the marker char in place (preserves spacing/CRLF/no-trailing-newline); already-done → unchanged; no line for id → `PlanError`.
+- Next tasks: T04 uses `parse` output + dict order for "plan order"; unknown/cross-dependency ids are left as-is here, ordering decides they count as done.

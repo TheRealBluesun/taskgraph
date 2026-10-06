@@ -5,7 +5,7 @@ Do the FIRST unchecked task only. Each task: implement per SPEC.md, add/extend u
 
 - [x] T01 Skeleton: package `taskgraph/` (`__init__.py`, `cli.py` with argparse subcommands from SPEC §10 that print "not implemented" for now), `bin/taskgraph`, `tests/` with one passing smoke test, README.md (5–10 lines: what it is, how to run tests).
 - [x] T02 Config loader per SPEC §1 (`taskgraph/config.py`, dataclasses, validation errors name the key and file); tests incl. the example toml from SPEC and two invalid configs.
-- [ ] T03 Plan parser + `mark_done` per SPEC §2 (`taskgraph/plan.py`); tests: tags, done/undone, ids with suffix letter, unrelated lines untouched by mark_done.
+- [x] T03 Plan parser + `mark_done` per SPEC §2 (`taskgraph/plan.py`); tests: tags, done/undone, ids with suffix letter, unrelated lines untouched by mark_done.
 - [ ] T04 Ordering per SPEC §3 (`taskgraph/order.py`, pure): critical path, started-first callable, plan order, cycle safety; tests with a small graph where the critical-path task is last in plan order.
 - [ ] T05 Metrics parsing per SPEC §4 (`taskgraph/metrics.py`): parse Prometheus text (running, waiting, generation_tokens_total; multiple series summed), `sample(url)` with urllib returning None on errors; tests on fixture text (no network).
 - [ ] T06 Model pool policy per SPEC §4 (`taskgraph/pool.py`, pure): `choose_model` incl. over-session rule, 180 s spacing, and the throughput-peak veto; table-driven tests.
