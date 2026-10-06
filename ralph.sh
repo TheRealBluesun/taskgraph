@@ -16,7 +16,7 @@ for i in $(seq 1 $N); do
   if grep -q "^- \[ \] $task" PLAN.md; then echo "$(date +%T) !!! blocked $task: not marked done — review"; exit 1; fi
   if ! python3 -m unittest discover -s tests -q >> "$log" 2>&1; then echo "$(date +%T) !!! blocked $task: tests fail — review"; exit 1; fi
   title=$(grep -m1 "^- \[x\] $task" PLAN.md | sed -E 's/^- \[x\] [A-Z]+[0-9]+[a-z]? //' | tr -d '`' | cut -c1-60)
-  git add -A -- . ':!logs' && git commit -q -m "$task: $title
+  git add -A && git commit -q -m "$task: $title
 
 Implemented by omp (ralph loop); planned and reviewed with Claude.
 
