@@ -113,6 +113,14 @@ class DefaultsTest(ConfigTestBase):
         self.assertEqual(cfg.agent.retries, 2)
         self.assertEqual(cfg.agent.deny, ())
         self.assertEqual(cfg.models[0].max_agents, 2)  # defaults to sessions
+        self.assertEqual(cfg.trailer, ())
+
+    def test_trailer_lines_are_parsed(self):
+        toml = MINIMAL_TOML.replace(
+            'main = "main"', 'main = "main"\ntrailer = ["Taskgraph-Task: {id}"]'
+        )
+        cfg = self.load_text(toml)
+        self.assertEqual(cfg.trailer, ("Taskgraph-Task: {id}",))
 
     def test_accepts_str_path_and_relative_resolution(self):
         cfg = self.load_text(MINIMAL_TOML)
@@ -200,6 +208,10 @@ sessions = 1
             'name = "m1"\nsessions = 2\nfallback = "ghost"',
         )
         self.assert_error(toml, "unknown fallback 'ghost'")
+
+    def test_trailer_must_be_an_array_of_strings(self):
+        toml = MINIMAL_TOML.replace('main = "main"', 'main = "main"\ntrailer = "x"')
+        self.assert_error(toml, "trailer' must be an array of non-empty strings")
 
     def test_invalid_toml(self):
         self.assert_error("plan = [unclosed", "invalid TOML")

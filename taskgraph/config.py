@@ -63,6 +63,7 @@ class Config:
     resources: Mapping[str, int]
     agent: AgentConfig
     models: tuple[ModelConfig, ...]
+    trailer: tuple[str, ...] = ()
 
     @property
     def root(self) -> Path:
@@ -112,6 +113,7 @@ def _build(data: Mapping[str, Any], path: Path) -> Config:
         resources=_resources(data.get("resources"), path),
         agent=_agent(data.get("agent"), path),
         models=_models(data.get("models"), path),
+        trailer=_string_list(data, "trailer", path, where="", default=()),
     )
 
 

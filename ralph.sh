@@ -13,7 +13,7 @@ for i in $(seq 1 $N); do
   echo "$(date +%T) === start $task (log: $log)"
   run_omp "$task" "$log"
   [[ $OMP_REASON != done ]] && echo "$(date +%T) !!! omp $OMP_REASON on $task"
-  if grep -q "^- \[ \] $task" PLAN.md; then echo "$(date +%T) !!! blocked $task: not marked done — review"; exit 1; fi
+  if grep -q "^- \[ \] $task " PLAN.md; then echo "$(date +%T) !!! blocked $task: not marked done — review"; exit 1; fi
   if ! python3 -m unittest discover -s tests -q >> "$log" 2>&1; then echo "$(date +%T) !!! blocked $task: tests fail — review"; exit 1; fi
   title=$(grep -m1 "^- \[x\] $task" PLAN.md | sed -E 's/^- \[x\] [A-Z]+[0-9]+[a-z]? //' | tr -d '`' | cut -c1-60)
   git add -A && git commit -q -m "$task: $title
