@@ -93,6 +93,18 @@ class ElixirExampleTest(unittest.TestCase):
         # The SPEC §9 defaults still apply (the docs promise they do).
         self.assertEqual(bucket_for(Call("bash", "xcodebuild -scheme Elixir build"), patterns), "build")
 
+    def test_router_workers_keep_the_paid_one_last_and_capped(self):
+        # SPEC §11: request-level capacity, local workers first, one paid overflow with a spend cap.
+        workers = self.cfg.workers
+        self.assertEqual([worker.name for worker in workers], ["flash", "27b", "deepseek"])
+        self.assertEqual(workers[0].concurrency, 1, "the .10 server takes one long-context request")
+        self.assertIsNotNone(workers[0].max_context, "long prompts must skip the flash worker")
+        self.assertTrue(all(not worker.overflow for worker in workers[:-1]))
+        paid = workers[-1]
+        self.assertTrue(paid.overflow)
+        self.assertEqual(paid.api_key_env, "DEEPSEEK_API_KEY")
+        self.assertGreaterEqual(paid.max_requests_per_hour, 1)
+
     def test_the_dev_sh_guide_is_where_the_config_points(self):
         guide = ELIXIR / "dev-sh-lease.md"
         self.assertTrue(guide.is_file(), f"{guide} is missing")

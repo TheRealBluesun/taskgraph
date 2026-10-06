@@ -19,6 +19,8 @@ from . import (
     lease,
     leaseprocs,
     models,
+    proxyserver,
+    router,
     scheduler,
     side,
     state,
@@ -51,6 +53,7 @@ SUBCOMMANDS: dict[str, str] = {
     "stop": "stop the scheduler (--agents also stops agents)",
     "lease": "wait for a resource lease, then run a command",
     "side": "lease a model's job-class capacity, then run a command",
+    "router": "serve the OpenAI-compatible request router (SPEC §11)",
     "retry": "unblock a blocked task (resumes its worktree)",
 }
 
@@ -316,6 +319,34 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     return 0 if result.stopped_anything() else 1
 
 
+def _cmd_router(args: argparse.Namespace) -> int:
+    """``taskgraph router``: serve the OpenAI-compatible request router (SPEC §11)."""
+    if args.project:
+        config_path = Path(args.project) / CONFIG_NAME
+        if not config_path.is_file():
+            print(f"taskgraph router: no {CONFIG_NAME} in {args.project}", file=sys.stderr)
+            return 2
+    else:
+        config_path = find_config()
+        if config_path is None:
+            print(
+                f"taskgraph router: no {CONFIG_NAME} found in this directory or its parents",
+                file=sys.stderr,
+            )
+            return 2
+    try:
+        config = load(config_path)
+    except ConfigError as exc:
+        print(f"taskgraph router: {exc}", file=sys.stderr)
+        return 2
+    return proxyserver.run_router(
+        config,
+        host=args.host,
+        port=args.port,
+        queue_timeout=args.queue_timeout,
+    )
+
+
 def _cmd_retry(args: argparse.Namespace) -> int:
     """``taskgraph retry <id>``: unblock a task and resume its worktree (SPEC §10)."""
     config = _project_config("retry")
@@ -354,6 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.choices["models"].set_defaults(func=_cmd_models)
     sub.choices["lease"].set_defaults(func=_cmd_lease)
     sub.choices["side"].set_defaults(func=_cmd_side)
+    sub.choices["router"].set_defaults(func=_cmd_router)
     sub.choices["leases"].set_defaults(func=_cmd_leases)
     sub.choices["stop"].set_defaults(func=_cmd_stop)
     sub.choices["retry"].set_defaults(func=_cmd_retry)
@@ -379,6 +411,20 @@ def build_parser() -> argparse.ArgumentParser:
     side_parser.add_argument("--task", metavar="ID", help="task id recorded in the slot file")
     side_parser.add_argument(
         "cmd", nargs="+", help="command to run, after -- (gets TASKGRAPH_MODEL)"
+    )
+
+    router_parser = sub.choices["router"]
+    router_parser.add_argument("--project", metavar="DIR", help="project root (default: cwd)")
+    router_parser.add_argument("--host", default=proxyserver.DEFAULT_HOST, help="listen address")
+    router_parser.add_argument(
+        "--port", type=int, default=proxyserver.DEFAULT_PORT, help="listen port (0 picks a free one)"
+    )
+    router_parser.add_argument(
+        "--queue-timeout",
+        type=float,
+        default=0.0,
+        metavar="SECS",
+        help="give up on a request that waited this long (0 waits forever)",
     )
 
     sub.choices["retry"].add_argument("id", metavar="ID", help="blocked task id")

@@ -54,6 +54,34 @@ max_agents = 2
 
 trailer = ["Co-authored-by: taskgraph <noreply@taskgraph>"]   # appended to every merge commit (SPEC §8)
 
+# The request router (SPEC §11). Point every agent's OpenAI client at ONE endpoint —
+# `taskgraph router` (default http://127.0.0.1:8080/v1) — and each generation request is dispatched
+# to the best worker with a free slot: affinity to the worker that served this agent last (keeps the
+# prefix cache warm), else config order (priority), else a FIFO wait. Request-level capacity is what
+# protects a server: a second long-context request on .10 thrashes its KV cache, which is why the
+# [models] counts above can be higher than `concurrency` here.
+[[workers]]
+name = "flash"                              # free-form; defaults to `model`
+upstream = "http://10.10.10.10:8000"        # OpenAI-compatible base URL (the /v1 path is appended)
+model = "local-vllm-flash/Qwen3.8-Flash-Next"   # the request's `model` field is rewritten to this
+concurrency = 1                             # one long-context request at a time
+max_context = 70000                         # prompts estimated above this (chars/3.5) skip this worker
+
+[[workers]]
+name = "27b"
+upstream = "http://10.10.10.15:8002"
+model = "local-vllm-27b/Qwen3.8-27B"
+concurrency = 3                             # the .15 server peaks at ~3 concurrent requests
+
+[[workers]]
+name = "deepseek"
+upstream = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+concurrency = 4
+api_key_env = "DEEPSEEK_API_KEY"            # Authorization: Bearer $DEEPSEEK_API_KEY — never logged
+overflow = true                             # paid: only used while every local worker is full
+max_requests_per_hour = 60                  # required for an overflow worker: the spend cap
+
 # Refuse a merge commit that looks like a build dump (SPEC §8). The defaults already block
 # .build/ build/ DerivedData/ node_modules/ __pycache__/ target/ dist/.
 [merge]

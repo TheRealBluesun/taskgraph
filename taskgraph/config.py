@@ -50,6 +50,30 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class WorkerConfig:
+    """One ``[[workers]]`` entry: a backend for the request router (SPEC §11).
+
+    ``upstream`` is the OpenAI-compatible base URL; the router rewrites the
+    request's ``model`` field to ``model`` and, when ``api_key_env`` is set,
+    injects ``Authorization: Bearer $<api_key_env>`` (the value is never
+    logged).  ``concurrency`` is the request-level capacity that protects the
+    server.  ``max_context`` skips the worker for larger estimated prompts
+    (chars/3.5).  ``overflow`` workers are paid: they only see traffic while
+    every earlier worker is full and cap themselves to
+    ``max_requests_per_hour`` admitted requests.
+    """
+
+    name: str
+    upstream: str
+    model: str
+    concurrency: int = 1
+    max_context: int | None = None
+    api_key_env: str | None = None
+    overflow: bool = False
+    max_requests_per_hour: int | None = None
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     """The ``[agent]`` table: how each coding agent is launched and watched."""
 
@@ -112,6 +136,7 @@ class Config:
     resources: Mapping[str, int]
     agent: AgentConfig
     models: tuple[ModelConfig, ...]
+    workers: tuple[WorkerConfig, ...] = ()
     trailer: tuple[str, ...] = ()
     merge: MergeConfig = MergeConfig()
     stats: StatsConfig = StatsConfig()
@@ -126,6 +151,13 @@ class Config:
         for model in self.models:
             if model.name == name:
                 return model
+        return None
+
+    def worker(self, name: str) -> WorkerConfig | None:
+        """Return the router worker called ``name``, or ``None`` (SPEC §11)."""
+        for worker in self.workers:
+            if worker.name == name:
+                return worker
         return None
 
 
@@ -164,6 +196,7 @@ def _build(data: Mapping[str, Any], path: Path) -> Config:
         resources=_resources(data.get("resources"), path),
         agent=_agent(data.get("agent"), path),
         models=_models(data.get("models"), path),
+        workers=_workers(data.get("workers"), path),
         trailer=_string_list(data, "trailer", path, where="", default=()),
         merge=_merge(data.get("merge"), path),
         stats=_stats(data.get("stats"), path),
@@ -258,6 +291,60 @@ def _models(raw: Any, path: Path) -> tuple[ModelConfig, ...]:
                 f"{path}: model '{model.name}' has unknown fallback '{model.fallback}'"
             )
     return tuple(models)
+
+
+def _workers(raw: Any, path: Path) -> tuple[WorkerConfig, ...]:
+    """Validate the optional ``[[workers]]`` array of tables (SPEC §11).
+
+    Workers are tried in config order (priority); ``overflow`` workers go last,
+    so they only see traffic while every local worker is full.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"{path}: [[workers]] must be an array of tables")
+
+    workers: list[WorkerConfig] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(raw):
+        where = f"[[workers]][{index}] "
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{path}: {where}must be a table")
+        upstream = _string(entry, "upstream", path, where=where)
+        if not upstream.startswith(("http://", "https://")):
+            raise ConfigError(
+                f"{path}: {where}'upstream' must be an http(s) URL, not {upstream!r}"
+            )
+        model = _string(entry, "model", path, where=where)
+        name = _string(entry, "name", path, where=where, default=model)
+        if name in seen:
+            raise ConfigError(
+                f"{path}: {where}duplicate worker name '{name}' (set a distinct 'name')"
+            )
+        seen.add(name)
+        overflow = _bool(entry, "overflow", path, where=where, default=False)
+        cap = _opt_int(entry, "max_requests_per_hour", path, where=where, minimum=1)
+        if overflow and cap is None:
+            raise ConfigError(
+                f"{path}: {where}an 'overflow' worker must set 'max_requests_per_hour'"
+            )
+        if cap is not None and not overflow:
+            raise ConfigError(
+                f"{path}: {where}'max_requests_per_hour' is only valid with 'overflow = true'"
+            )
+        workers.append(
+            WorkerConfig(
+                name=name,
+                upstream=upstream.rstrip("/"),
+                model=model,
+                concurrency=_int(entry, "concurrency", path, where=where, default=1, minimum=1),
+                max_context=_opt_int(entry, "max_context", path, where=where, minimum=1),
+                api_key_env=_string(entry, "api_key_env", path, where=where, default=None),
+                overflow=overflow,
+                max_requests_per_hour=cap,
+            )
+        )
+    return tuple(workers)
 
 
 def _classes(raw: Any, path: Path, where: str) -> Mapping[str, int]:
@@ -382,6 +469,37 @@ def _number(
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ConfigError(f"{path}: '{where}{key}' must be a number, not {value!r}")
     return float(value)
+
+
+def _bool(
+    table: Mapping[str, Any],
+    key: str,
+    path: Path,
+    *,
+    where: str,
+    default: bool,
+) -> bool:
+    """Return a true/false value, or ``default`` when the key is absent."""
+    if key not in table:
+        return default
+    value = table[key]
+    if not isinstance(value, bool):
+        raise ConfigError(f"{path}: '{where}{key}' must be true or false, not {value!r}")
+    return value
+
+
+def _opt_int(
+    table: Mapping[str, Any],
+    key: str,
+    path: Path,
+    *,
+    where: str,
+    minimum: int,
+) -> int | None:
+    """Return an optional integer value, validating ``minimum`` when present."""
+    if key not in table:
+        return None
+    return _int(table, key, path, where=where, minimum=minimum)
 
 
 def _string_list(

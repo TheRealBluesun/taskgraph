@@ -12,6 +12,7 @@ from taskgraph.config import (
     MergeConfig,
     ModelConfig,
     StatsConfig,
+    WorkerConfig,
     load,
 )
 
@@ -300,6 +301,111 @@ class JobClassesTest(ConfigTestBase):
         model = self.load_text(toml).models[0]
         self.assertEqual(model.capacity("agent"), 0)
         self.assertEqual(model.capacity("side"), 1)
+
+
+class WorkersTest(ConfigTestBase):
+    """``[[workers]]``: the request router's backends (SPEC §11)."""
+
+    WORKER_TOML = MINIMAL_TOML + """
+[[workers]]
+upstream = "http://10.10.10.10:8000/"
+model = "local-flash"
+concurrency = 2
+max_context = 60000
+api_key_env = "FLASH_KEY"
+
+[[workers]]
+name = "paid"
+upstream = "https://api.example.com"
+model = "big"
+overflow = true
+max_requests_per_hour = 20
+"""
+
+    def test_optional_and_defaulted(self):
+        cfg = self.load_text(MINIMAL_TOML)
+        self.assertEqual(cfg.workers, ())
+        self.assertIsNone(cfg.worker("nope"))
+        cfg = self.load_text(MINIMAL_TOML + '\n[[workers]]\nupstream = "http://h:1"\nmodel = "m"')
+        worker = cfg.workers[0]
+        self.assertEqual(worker, WorkerConfig(name="m", upstream="http://h:1", model="m"))
+        self.assertEqual(worker.concurrency, 1)
+        self.assertIsNone(worker.max_context)
+        self.assertIsNone(worker.api_key_env)
+        self.assertFalse(worker.overflow)
+        self.assertIsNone(worker.max_requests_per_hour)
+
+    def test_full_table_and_lookup(self):
+        cfg = self.load_text(self.WORKER_TOML)
+        first, paid = cfg.workers
+        self.assertEqual(first.name, "local-flash")  # name defaults to the model
+        self.assertEqual(first.upstream, "http://10.10.10.10:8000")  # trailing slash dropped
+        self.assertEqual(first.concurrency, 2)
+        self.assertEqual(first.max_context, 60000)
+        self.assertEqual(first.api_key_env, "FLASH_KEY")
+        self.assertTrue(paid.overflow)
+        self.assertEqual(paid.max_requests_per_hour, 20)
+        self.assertEqual(cfg.worker("paid"), paid)
+        self.assertEqual(cfg.worker("local-flash"), first)
+
+    def test_workers_are_not_a_list(self):
+        self.assert_error(
+            MINIMAL_TOML.replace('main = "main"', 'main = "main"\nworkers = 3'),
+            "[[workers]] must be an array of tables",
+        )
+
+    def test_duplicate_worker_names(self):
+        self.assert_error(
+            MINIMAL_TOML
+            + '\n[[workers]]\nupstream = "http://h1"\nmodel = "m"\n'
+            + '[[workers]]\nupstream = "http://h2"\nmodel = "m"\n',
+            "duplicate worker name 'm'",
+        )
+
+    def test_worker_entry_must_be_a_table(self):
+        self.assert_error(
+            MINIMAL_TOML.replace('main = "main"', 'main = "main"\nworkers = ["x"]'),
+            "[[workers]][0] must be a table",
+        )
+
+    def test_required_and_validated_keys(self):
+        base = MINIMAL_TOML + "\n[[workers]]\n"
+        self.assert_error(base + 'model = "m"', "missing required key '[[workers]][0] upstream'")
+        self.assert_error(base + 'upstream = "http://h"', "missing required key '[[workers]][0] model'")
+        self.assert_error(
+            base + 'upstream = "10.0.0.1:8000"\nmodel = "m"',
+            "'upstream' must be an http(s) URL",
+        )
+        self.assert_error(
+            base + 'upstream = "http://h"\nmodel = "m"\nconcurrency = 0',
+            "[[workers]][0] concurrency' must be >= 1",
+        )
+        self.assert_error(
+            base + 'upstream = "http://h"\nmodel = "m"\nmax_context = 0',
+            "[[workers]][0] max_context' must be >= 1",
+        )
+        self.assert_error(
+            base + 'upstream = "http://h"\nmodel = "m"\napi_key_env = ""',
+            "[[workers]][0] api_key_env' must be a non-empty string",
+        )
+        self.assert_error(
+            base + 'upstream = "http://h"\nmodel = "m"\noverflow = "yes"',
+            "[[workers]][0] overflow' must be true or false",
+        )
+
+    def test_overflow_capacity_caps(self):
+        base = MINIMAL_TOML + "\n[[workers]]\nupstream = \"http://h\"\nmodel = \"m\"\n"
+        self.assert_error(
+            base + "overflow = true", "an 'overflow' worker must set 'max_requests_per_hour'"
+        )
+        self.assert_error(
+            base + "max_requests_per_hour = 5",
+            "[[workers]][0] 'max_requests_per_hour' is only valid with 'overflow = true'",
+        )
+        self.assert_error(
+            base + "overflow = true\nmax_requests_per_hour = 0",
+            "[[workers]][0] max_requests_per_hour' must be >= 1",
+        )
 
 
 class InvalidConfigTest(ConfigTestBase):

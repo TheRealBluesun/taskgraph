@@ -30,6 +30,7 @@ bin/taskgraph stats --since 6h     # per task: model time vs tool time, bucketed
 bin/taskgraph models               # tokens/s per model by concurrency (pick `sessions` from this)
 bin/taskgraph leases               # who holds each shared resource right now
 bin/taskgraph side side -- <cmd>   # lease a model's `side` job-class capacity, run <cmd> with TASKGRAPH_MODEL
+bin/taskgraph router               # serve the OpenAI-compatible request router (SPEC §11)
 bin/taskgraph stop [--agents]      # stop the scheduler (--agents: kill its agents too)
 bin/taskgraph retry <id>           # unblock a blocked task and resume its worktree
 ```
@@ -53,6 +54,36 @@ them directly is told to go through the project's wrapper (`./dev.sh`), which ta
 [`examples/elixir/dev-sh-lease.md`](examples/elixir/dev-sh-lease.md) for a worked migration of a
 project's ad-hoc lock dir.
 
+### The request router
+
+An agent is not bound to a model: point its OpenAI client at one endpoint,
+`taskgraph router` (default `http://127.0.0.1:8080/v1`), and every *request* is dispatched to the best
+worker with a free slot — affinity to the server that served this agent last (keeps the prefix cache
+warm), else `[[workers]]` order, else a FIFO wait (by `X-Taskgraph-Priority`, then arrival).
+
+```toml
+[[workers]]
+name = "flash"                    # free-form; defaults to `model`
+upstream = "http://10.10.10.10:8000"
+model = "local-vllm-flash/Qwen3.8-Flash-Next"   # the request's `model` field is rewritten to this
+concurrency = 1                   # request slots: the second long-context prompt would thrash the cache
+max_context = 70000               # prompts estimated above this (chars/3.5) skip this worker
+
+[[workers]]
+name = "deepseek"
+upstream = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+concurrency = 4
+api_key_env = "DEEPSEEK_API_KEY"  # Authorization: Bearer $DEEPSEEK_API_KEY — never logged
+overflow = true                   # paid: only used while every local worker is full
+max_requests_per_hour = 60        # required for an overflow worker: the spend cap
+```
+
+`GET /router/stats` reports per worker in-flight/queued/admitted/busy-seconds/utilization (last 10
+minutes), the affinity hit rate, and each agent's worker switches. `--queue-timeout SECS` makes a
+request that waited too long answer 503 instead of waiting forever (default: wait); `--port 0` picks a
+free port.
+
 ### How a task finishes
 
 The agent writes `progress/<id>.done` when its task is verified; a single merge worker then commits
@@ -68,6 +99,7 @@ python3 -m unittest discover -s tests -q
 ```
 
 Tests never call omp, a model or the network: agents are faked with small shell scripts, git repos are
-created in temp dirs, and metrics are injected.
+created in temp dirs, metrics are injected, and the router is exercised against loopback fake
+upstreams.
 
 See `SPEC.md` for the authoritative behaviour and `PLAN.md` for the build order.
