@@ -1,8 +1,8 @@
 """Tests for ``taskgraph lease`` / ``taskgraph leases`` (SPEC §5, SPEC §10).
 
 The semaphore itself is covered in ``test_lease.py``; here we exercise the
-command wrapper: exit codes, ``TASKGRAPH_LEASE``, signal forwarding, waiting,
-the config lookup and the rendered holders table.
+command wrapper: exit codes, ``TASKGRAPH_LEASE``, signal forwarding, waiting
+and the config lookup. The table rendering lives in ``test_status.py``.
 """
 
 import io
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from leasehelpers import BIN, MINIMAL_TOML, LeaseTestCase, wait_until
 
-from taskgraph import cli, lease
+from taskgraph import cli
 
 
 def _pid_alive(pid: int) -> bool:
@@ -31,36 +31,6 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
-
-
-class FormattingTest(unittest.TestCase):
-    def slot(self, **kw):
-        fields = dict(
-            resource="simulator",
-            n=0,
-            pid=4242,
-            cmd="xcodebuild -scheme App",
-            cwd="/w",
-            task="F03",
-            since=1000.0,
-            path=Path("/tmp/slot-0"),
-        )
-        fields.update(kw)
-        return lease.Slot(**fields)
-
-    def test_format_age(self):
-        self.assertEqual(cli.format_age(0), "0s")
-        self.assertEqual(cli.format_age(59.9), "59s")
-        self.assertEqual(cli.format_age(73.9), "1m13s")
-        self.assertEqual(cli.format_age(125), "2m05s")
-        self.assertEqual(cli.format_age(3720), "1h02m")
-
-    def test_format_holders_table(self):
-        lines = cli.format_holders([self.slot()], now=1073.0).splitlines()
-        self.assertEqual(lines[0].split(), ["RESOURCE", "SLOT", "PID", "TASK", "AGE", "COMMAND"])
-        for cell in ("simulator", "slot-0", "4242", "F03", "1m13s", "xcodebuild -scheme App"):
-            self.assertIn(cell, lines[1])
-        self.assertEqual(cli.format_holders([]), "no leases held")
 
 
 class RunLeaseTest(LeaseTestCase):

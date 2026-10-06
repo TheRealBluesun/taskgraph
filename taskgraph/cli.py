@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Sequence, TextIO
 
-from . import assign, control, lease, leaseprocs, scheduler, worktree
+from . import assign, control, lease, leaseprocs, scheduler, state, status, worktree
 from .config import Config, ConfigError, load
 from .procsig import (
     GROUP_GRACE,
@@ -56,41 +56,6 @@ def find_config(start: Path | str | None = None) -> Path | None:
         if config.is_file():
             return config
     return None
-
-
-def format_age(seconds: float) -> str:
-    """Render a duration the way ``taskgraph leases`` does: ``59s``, ``2m05s``."""
-    total = int(seconds)
-    if total < 60:
-        return f"{total}s"
-    minutes, secs = divmod(total, 60)
-    if minutes < 60:
-        return f"{minutes}m{secs:02d}s"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h{minutes:02d}m"
-
-
-def format_holders(slots: Sequence[lease.Slot], now: float | None = None) -> str:
-    """Render live holders as an aligned table for ``taskgraph leases``."""
-    if not slots:
-        return "no leases held"
-    header = ("RESOURCE", "SLOT", "PID", "TASK", "AGE", "COMMAND")
-    rows = [
-        [
-            slot.resource,
-            slot.name,
-            str(slot.pid),
-            slot.task or "-",
-            format_age(slot.age(now)),
-            slot.cmd,
-        ]
-        for slot in slots
-    ]
-    widths = [max(len(row[i]) for row in (header, *rows)) for i in range(len(header))]
-    return "\n".join(
-        "  ".join(cell.ljust(width) for cell, width in zip(row[:-1], widths[:-1])) + "  " + row[-1]
-        for row in (header, *rows)
-    ).rstrip()
 
 
 def run_lease(
@@ -254,7 +219,21 @@ def _cmd_lease(args: argparse.Namespace) -> int:
 
 def _cmd_leases(args: argparse.Namespace) -> int:
     """``taskgraph leases``: print current holders and their ages (SPEC §5)."""
-    print(format_holders(lease.holders()))
+    print(status.format_holders(lease.holders()))
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    """``taskgraph status``: running agents, queue, blocked, leases, load (SPEC §9)."""
+    config = _project_config("status")
+    if config is None:
+        return 2
+    try:
+        snapshot = status.collect(config)
+    except state.StateError as exc:
+        print(f"taskgraph status: {exc}", file=sys.stderr)
+        return 2
+    print(status.render(snapshot))
     return 0
 
 
@@ -314,6 +293,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=SUBCOMMANDS[name])
         sp.set_defaults(command=name, func=_not_implemented)
     sub.choices["run"].set_defaults(func=_cmd_run)
+    sub.choices["status"].set_defaults(func=_cmd_status)
     sub.choices["lease"].set_defaults(func=_cmd_lease)
     sub.choices["leases"].set_defaults(func=_cmd_leases)
     sub.choices["stop"].set_defaults(func=_cmd_stop)

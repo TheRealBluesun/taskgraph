@@ -20,9 +20,9 @@ class SmokeTest(unittest.TestCase):
 
     def test_remaining_subcommands_parse_and_stub(self):
         # `lease`/`leases` are implemented (T07), `run` in T13, `stop`/`retry`
-        # in T14; the rest stub.
+        # in T14, `status` in T15; the rest stub.
         for name in cli.SUBCOMMANDS:
-            if name in {"lease", "leases", "run", "stop", "retry"}:
+            if name in {"lease", "leases", "run", "stop", "retry", "status"}:
                 continue
             with self.subTest(command=name):
                 argv = [name]

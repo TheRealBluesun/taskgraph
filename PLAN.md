@@ -22,7 +22,7 @@ Do the FIRST unchecked task only. Each task: implement per SPEC.md, add/extend u
 - [x] T13 Scheduler loop (`taskgraph/scheduler.py` + `taskgraph run`, `--dry-run`): tick every 20 s (configurable for tests), adopt live agents from state on start, retries, merge queue hand-off, events log per SPEC §9; integration test: temp repo with 3 tasks (one dependent), fake agents, capacity 2 — all merge in the right order; a second test kills the scheduler mid-run and restarts it — agents are adopted, not restarted.
 - [x] T14 `taskgraph stop [--agents]`, `taskgraph retry <id>`; tests.
 - [x] T13b Stall exemption per SPEC §6 "stall": no stall kill while a `taskgraph lease` process with cwd inside the agent's worktree is alive; `agent.max_lease_secs` anomaly event; tests with a fake agent that runs `taskgraph lease sim -- sleep` beyond `stall_secs`.
-- [ ] T15 `taskgraph status` per SPEC §9; test renders a fixture state.
+- [x] T15 `taskgraph status` per SPEC §9; test renders a fixture state.
 - [ ] T16 `taskgraph stats` per SPEC §9 (omp trace parsing, buckets from config); tests on a small fixture trace (copy shape from SPEC: message_end with timestamp/duration/content toolCall, tool_execution_* lines).
 - [ ] T17 Idle watch + anomaly events per SPEC §9 and `taskgraph models` throughput-by-concurrency table per SPEC §4; tests with injected samples.
 - [ ] T18 `examples/elixir/taskgraph.toml` + `examples/elixir/dev-sh-lease.md` (how Elixir's dev.sh switches from its lock dir to `taskgraph lease simulator -- …`); README usage section. No changes to the Elixir repo.
