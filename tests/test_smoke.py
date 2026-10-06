@@ -17,13 +17,14 @@ class SmokeTest(unittest.TestCase):
     def test_version(self):
         self.assertEqual(taskgraph.__version__, "0.1.0")
 
-    def test_all_subcommands_parse_and_stub(self):
+    def test_remaining_subcommands_parse_and_stub(self):
+        # `lease` and `leases` are implemented (T07); the rest still report the stub.
         for name in cli.SUBCOMMANDS:
+            if name in {"lease", "leases"}:
+                continue
             with self.subTest(command=name):
                 argv = [name]
-                if name == "lease":
-                    argv += ["simulator", "--", "true"]
-                elif name == "retry":
+                if name == "retry":
                     argv += ["T01"]
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
