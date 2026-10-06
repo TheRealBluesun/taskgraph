@@ -42,6 +42,10 @@ DEFAULT_STATE_DIR = "~/.taskgraph"
 POLL_SECS = 2.0
 MESSAGE_SECS = 30.0
 
+#: Exit status when a lease wait times out (same as GNU ``timeout``); shared by
+#: ``taskgraph lease`` and ``taskgraph side``.
+TIMEOUT_EXIT = 124
+
 #: Shown by readers for a held slot whose info JSON is empty or half-written.
 STARTING = "starting…"
 

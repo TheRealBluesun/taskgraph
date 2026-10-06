@@ -30,11 +30,15 @@ simulator = 1
 # models last (SPEC §4). sessions = concurrent agents; max_agents = agents allowed while the server's
 # metrics show idle capacity (agents blocked on a build/lease do not use the GPU); metrics = vLLM
 # Prometheus URL (optional, but it enables the slack rule and the idle diagnostics).
+# classes splits capacity by job class (SPEC §4): plan tasks are `agent` (default = sessions); short
+# jobs run `taskgraph side side -- …` and get TASKGRAPH_MODEL back, preferring a model whose agent is
+# blocked on a tool. The .10 Flash KV cache fits one long-context agent — and one critic, nothing more.
 [[models]]
 name = "local-vllm-flash/Qwen3.8-Flash-Next"
 sessions = 1                                # one long-context coding request at a time on the .10 server
 max_agents = 2
 metrics = "http://10.10.10.10:8000/metrics"
+classes = { agent = 1, side = 1 }
 
 [[models]]
 name = "local-vllm-27b/Qwen3.8-27B"

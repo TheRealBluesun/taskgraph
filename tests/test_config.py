@@ -263,6 +263,45 @@ max_agents = 0
         )
 
 
+class JobClassesTest(ConfigTestBase):
+    """``[models.classes]`` job capacities (SPEC §4)."""
+
+    def test_agent_class_defaults_to_sessions_and_other_classes_are_absent(self):
+        cfg = self.load_text(MINIMAL_TOML)
+        model = cfg.models[0]
+        self.assertEqual(model.classes, {})
+        self.assertEqual(model.capacity("agent"), 2)
+        self.assertEqual(model.capacity("side"), 0)
+
+    def test_classes_split_capacity_and_override_the_agent_default(self):
+        toml = MINIMAL_TOML.replace("sessions = 2", "sessions = 3\nclasses = { agent = 1, side = 2 }")
+        model = self.load_text(toml).models[0]
+        self.assertEqual(model.classes, {"agent": 1, "side": 2})
+        self.assertEqual(model.capacity("agent"), 1)
+        self.assertEqual(model.capacity("side"), 2)
+        self.assertEqual(model.capacity("gpu"), 0)
+
+    def test_classes_must_be_a_table_of_non_negative_ints(self):
+        self.assert_error(
+            MINIMAL_TOML.replace("sessions = 2", 'sessions = 2\nclasses = ["side"]'),
+            "'classes' must be a table of capacities",
+        )
+        self.assert_error(
+            MINIMAL_TOML.replace("sessions = 2", 'sessions = 2\nclasses = { side = "one" }'),
+            "'classes.side' must be an integer >= 0",
+        )
+        self.assert_error(
+            MINIMAL_TOML.replace("sessions = 2", "sessions = 2\nclasses = { side = -1 }"),
+            "'classes.side' must be an integer >= 0",
+        )
+
+    def test_zero_disables_a_class(self):
+        toml = MINIMAL_TOML.replace("sessions = 2", "sessions = 2\nclasses = { agent = 0, side = 1 }")
+        model = self.load_text(toml).models[0]
+        self.assertEqual(model.capacity("agent"), 0)
+        self.assertEqual(model.capacity("side"), 1)
+
+
 class InvalidConfigTest(ConfigTestBase):
     def test_missing_required_root_key_names_key_and_file(self):
         err = self.assert_error(MINIMAL_TOML.replace('main = "main"\n', ""), "missing required key 'main'")
@@ -335,6 +374,8 @@ class DataclassTest(unittest.TestCase):
         model = ModelConfig(name="m", sessions=2, max_agents=2)
         self.assertIsNone(model.metrics)
         self.assertIsNone(model.fallback)
+        self.assertEqual(model.classes, {})
+        self.assertEqual(model.capacity("agent"), 2)
 
     def test_agent_config_defaults(self):
         agent = AgentConfig(command="omp")

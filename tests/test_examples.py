@@ -75,6 +75,13 @@ class ElixirExampleTest(unittest.TestCase):
         self.assertGreater(local.max_agents, local.sessions, "no model allows over-session agents")
         self.assertIsNotNone(local.metrics, "the over-session rule needs a metrics URL")
 
+    def test_flash_model_splits_agent_and_side_capacity(self):
+        # The .10 server fits one long-context agent and one short side job (SPEC §4).
+        flash = self.cfg.model("local-vllm-flash/Qwen3.8-Flash-Next")
+        self.assertIsNotNone(flash)
+        self.assertEqual(flash.capacity("agent"), 1)
+        self.assertEqual(flash.capacity("side"), 1)
+
     def test_merge_guard_blocks_the_playtest_output(self):
         self.assertIn("playtest-results", self.cfg.merge.deny_paths)
         self.assertTrue(denied("playtest-results/greedy.json", self.cfg.merge.deny_dirs))

@@ -20,6 +20,7 @@ from . import (
     leaseprocs,
     models,
     scheduler,
+    side,
     state,
     stats,
     status,
@@ -38,7 +39,7 @@ from .procsig import (
 )
 
 CONFIG_NAME = "taskgraph.toml"
-TIMEOUT_EXIT = 124
+TIMEOUT_EXIT = lease.TIMEOUT_EXIT
 
 # Subcommands and their one-line purpose, in SPEC §10 order (plus `models`, SPEC §4).
 SUBCOMMANDS: dict[str, str] = {
@@ -49,6 +50,7 @@ SUBCOMMANDS: dict[str, str] = {
     "leases": "print current lease holders with ages",
     "stop": "stop the scheduler (--agents also stops agents)",
     "lease": "wait for a resource lease, then run a command",
+    "side": "lease a model's job-class capacity, then run a command",
     "retry": "unblock a blocked task (resumes its worktree)",
 }
 
@@ -228,6 +230,21 @@ def _cmd_lease(args: argparse.Namespace) -> int:
     return run_lease(args.resource, args.cmd, capacity=capacity, task=args.task)
 
 
+def _cmd_side(args: argparse.Namespace) -> int:
+    """``taskgraph side``: lease a model's job-class capacity (SPEC §4)."""
+    if not args.cmd:
+        print("taskgraph side: no command given", file=sys.stderr)
+        return 2
+    config = _project_config("side")
+    if config is None:
+        return 2
+    try:
+        return side.run_side(args.cls, args.cmd, config, task=args.task)
+    except side.SideError as exc:
+        print(f"taskgraph side: {exc}", file=sys.stderr)
+        return 2
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     """``taskgraph stats``: split each task's wall time from its trace (SPEC §9)."""
     config = _project_config("stats")
@@ -336,6 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.choices["stats"].set_defaults(func=_cmd_stats)
     sub.choices["models"].set_defaults(func=_cmd_models)
     sub.choices["lease"].set_defaults(func=_cmd_lease)
+    sub.choices["side"].set_defaults(func=_cmd_side)
     sub.choices["leases"].set_defaults(func=_cmd_leases)
     sub.choices["stop"].set_defaults(func=_cmd_stop)
     sub.choices["retry"].set_defaults(func=_cmd_retry)
@@ -354,6 +372,13 @@ def build_parser() -> argparse.ArgumentParser:
     lease_parser.add_argument("--task", metavar="ID", help="task id recorded in the slot file")
     lease_parser.add_argument(
         "cmd", nargs="+", help="command to run, after -- (e.g. -- xcodebuild -scheme App)"
+    )
+
+    side_parser = sub.choices["side"]
+    side_parser.add_argument("cls", metavar="CLASS", help="job class, e.g. side")
+    side_parser.add_argument("--task", metavar="ID", help="task id recorded in the slot file")
+    side_parser.add_argument(
+        "cmd", nargs="+", help="command to run, after -- (gets TASKGRAPH_MODEL)"
     )
 
     sub.choices["retry"].add_argument("id", metavar="ID", help="blocked task id")

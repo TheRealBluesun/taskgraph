@@ -29,6 +29,7 @@ bin/taskgraph status               # running agents, merge queue, blocked tasks,
 bin/taskgraph stats --since 6h     # per task: model time vs tool time, bucketed (build/test/lease-wait)
 bin/taskgraph models               # tokens/s per model by concurrency (pick `sessions` from this)
 bin/taskgraph leases               # who holds each shared resource right now
+bin/taskgraph side side -- <cmd>   # lease a model's `side` job-class capacity, run <cmd> with TASKGRAPH_MODEL
 bin/taskgraph stop [--agents]      # stop the scheduler (--agents: kill its agents too)
 bin/taskgraph retry <id>           # unblock a blocked task and resume its worktree
 ```

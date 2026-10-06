@@ -18,21 +18,15 @@ class SmokeTest(unittest.TestCase):
     def test_version(self):
         self.assertEqual(taskgraph.__version__, "0.1.0")
 
-    def test_remaining_subcommands_parse_and_stub(self):
-        # `lease`/`leases` are implemented (T07), `run` in T13, `stop`/`retry`
-        # in T14, `status` in T15, `stats` in T16, `models` in T17.
+    def test_every_subcommand_has_a_real_handler(self):
+        # T19 completed the SPEC §10 surface (plus `models`/`side`): every
+        # command must parse to a real handler, never the "not implemented" stub.
+        argv_for = {"lease": ["r", "--", "true"], "side": ["cls", "--", "true"], "retry": ["T01"]}
+        parser = cli.build_parser()
         for name in cli.SUBCOMMANDS:
-            if name in {"lease", "leases", "run", "stop", "retry", "status", "stats", "models"}:
-                continue
             with self.subTest(command=name):
-                argv = [name]
-                if name == "retry":
-                    argv += ["T01"]
-                err = io.StringIO()
-                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-                    rc = cli.main(argv)
-                self.assertEqual(rc, 1)
-                self.assertEqual(err.getvalue().strip(), f"taskgraph {name}: not implemented")
+                parsed = parser.parse_args([name, *argv_for.get(name, [])])
+                self.assertIsNot(parsed.func, cli._not_implemented)
 
     def test_run_flags_parse(self):
         with tempfile.TemporaryDirectory() as tmp:

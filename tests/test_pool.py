@@ -92,6 +92,13 @@ class BaseSlotTest(unittest.TestCase):
         # sessions = max_agents = 0 disables a model (SPEC §1/§4).
         self.assertIsNone(choose([model(sessions=0, max_agents=0)], {"m": 5}, {"m": slack()})[0])
 
+    def test_agent_class_capacity_overrides_sessions(self):
+        # classes = { agent = 1 } caps plan tasks below sessions (SPEC §4). No
+        # metrics, so the over-session branch cannot grant the extra agent.
+        capped = ModelConfig(name="m", sessions=3, max_agents=3, classes={"agent": 1})
+        self.assertEqual(choose([capped], {"m": 0})[0], "m")
+        self.assertIsNone(choose([capped], {"m": 1})[0])
+
     def test_no_model_free_returns_none(self):
         self.assertIsNone(choose([model(max_agents=1)], {"m": 1})[0])
 

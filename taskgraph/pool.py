@@ -107,9 +107,10 @@ def choose_model(
     """Return the name of the model that should take the next agent, or ``None``.
 
     ``models`` is in config order and one pass decides: a model is free when it
-    has a free base slot (``assigned < sessions``) or its over-session gates
-    pass. So an earlier model with measured slack wins over a later model's
-    still-free base slot; ties go to the earlier entry.
+    has a free base slot (``assigned < sessions``, or the model's explicit
+    ``agent``-class capacity, SPEC §4) or its over-session gates pass. So an
+    earlier model with measured slack wins over a later model's still-free base
+    slot; ties go to the earlier entry.
 
     ``assigned`` counts the running agents per model name; ``recent`` holds each
     model's slack window (:func:`recent_samples`); ``history`` holds its full
@@ -124,7 +125,7 @@ def choose_model(
     :func:`token_rates` veto on the full history.
     """
     for model in models:
-        if assigned.get(model.name, 0) < model.sessions:
+        if assigned.get(model.name, 0) < model.capacity("agent"):
             return model.name
         if _extra_free(
             model,

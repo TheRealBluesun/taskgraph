@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -41,6 +41,12 @@ class ModelConfig:
     max_agents: int
     metrics: str | None = None
     fallback: str | None = None
+    #: Job-class capacities, ``classes = { agent = 1, side = 1 }`` (SPEC §4).
+    classes: Mapping[str, int] = field(default_factory=dict)
+
+    def capacity(self, cls: str) -> int:
+        """Concurrent ``cls`` jobs allowed here (0 = disabled); ``agent`` = ``sessions``."""
+        return {"agent": self.sessions, **self.classes}.get(cls, 0)
 
 
 @dataclass(frozen=True)
@@ -241,6 +247,7 @@ def _models(raw: Any, path: Path) -> tuple[ModelConfig, ...]:
                 max_agents=max_agents,
                 metrics=_string(entry, "metrics", path, where=where, default=None),
                 fallback=_string(entry, "fallback", path, where=where, default=None),
+                classes=_classes(entry.get("classes"), path, where),
             )
         )
 
@@ -251,6 +258,22 @@ def _models(raw: Any, path: Path) -> tuple[ModelConfig, ...]:
                 f"{path}: model '{model.name}' has unknown fallback '{model.fallback}'"
             )
     return tuple(models)
+
+
+def _classes(raw: Any, path: Path, where: str) -> Mapping[str, int]:
+    """Validate a model's optional ``classes`` job-capacity table (SPEC §4)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: {where}'classes' must be a table of capacities")
+    for name, capacity in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(f"{path}: {where}'classes' names must be non-empty strings")
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:
+            raise ConfigError(
+                f"{path}: {where}'classes.{name}' must be an integer >= 0, not {capacity!r}"
+            )
+    return dict(raw)
 
 
 def _merge(raw: Any, path: Path) -> MergeConfig:
