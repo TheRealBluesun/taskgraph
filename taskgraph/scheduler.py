@@ -87,6 +87,7 @@ class Scheduler:
         self.running: dict[str, agent.AgentRecord] = {}
         self.merging: set[str] = set()
         self.forced: dict[str, str] = {}
+        self._lease_anomalies: set[int] = set()
         self._results: list[merge.MergeResult] = []
         self._result_lock = threading.Lock()
         self.queue = merge.MergeQueue(cfg, on_result=self._merge_result)
@@ -252,8 +253,24 @@ class Scheduler:
                 self._requeue(record, "startup hang")
                 continue
             if agent.stalled(record.log, now, self.cfg.agent.stall_secs):
-                self._event("stall", record.id, f"no trace growth for {self.cfg.agent.stall_secs:g}s")
-                self._requeue(record, "stalled")
+                hold = agent.oldest_lease(record, root=self.state_root)
+                if hold is None:
+                    self._event(
+                        "stall", record.id, f"no trace growth for {self.cfg.agent.stall_secs:g}s"
+                    )
+                    self._requeue(record, "stalled")
+                else:
+                    # A queued/holding lease process keeps the agent silent by
+                    # design (SPEC §6): never stall-kill it. A lease that lives
+                    # past agent.max_lease_secs is the anomaly instead.
+                    age = hold.age(now)
+                    if age > self.cfg.agent.max_lease_secs and hold.pid not in self._lease_anomalies:
+                        self._lease_anomalies.add(hold.pid)
+                        self._event(
+                            "anomaly",
+                            record.id,
+                            f"{hold.resource} lease held {age:.0f}s (pid {hold.pid})",
+                        )
                 continue
             fallback = agent.fallback_model(record, self.cfg)
             if fallback is not None:

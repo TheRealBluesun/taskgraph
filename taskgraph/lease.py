@@ -17,6 +17,10 @@ again and reports only the slots that stayed locked.
 
 All paths come from ``$TASKGRAPH_STATE`` (default ``~/.taskgraph``), never from
 a project dir, so agents cannot rewrite the machinery (SPEC §5).
+
+Live wrappers announce themselves next to the slots (``taskgraph.leaseprocs``);
+that is how the scheduler's stall watchdog sees an agent waiting for a resource
+(SPEC §6).
 """
 
 from __future__ import annotations

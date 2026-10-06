@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from taskgraph import agent, prompt, worktree
+from taskgraph import agent, leaseprocs, prompt, worktree
 from taskgraph.config import ModelConfig
 from agenthelpers import AgentTestCase, make_config, make_task, wait_for
 
@@ -246,6 +246,58 @@ class QuotaTest(AgentTestCase):
         record = self.record("quota exceeded")
         record.model = "ghost"
         self.assertIsNone(agent.fallback_model(record, self.cfg))
+
+
+class LeaseExemptionTest(AgentTestCase):
+    """The stall watchdog must see the lease wrappers in an agent's worktree (SPEC §6)."""
+
+    def process(self, cwd, *, pid=None, since=10.0):
+        return leaseprocs.LeaseProcess(
+            pid=os.getpid() if pid is None else pid,
+            resource="sim",
+            cwd=str(cwd),
+            cmd="sleep 30",
+            since=since,
+            path=self.base / "procs" / "x.json",
+        )
+
+    def record(self) -> agent.AgentRecord:
+        return agent.AgentRecord(
+            id="T01", pid=1, pgid=1, model="m1", worktree=str(self.worktree),
+            log=str(self.base / "trace.log"), started=0.0,
+        )
+
+    def test_only_wrappers_inside_the_worktree_count(self):
+        procs = [
+            self.process(self.base / "other"),
+            self.process(self.worktree / "sub"),
+            self.process(self.worktree),
+            self.process(self.base / "wt-sibling"),  # shares a name prefix, not a child
+        ]
+        found = agent.lease_processes(self.worktree, processes=procs)
+        self.assertEqual(
+            [proc.cwd for proc in found],
+            [str(self.worktree / "sub"), str(self.worktree)],
+        )
+
+    def test_symlinked_worktree_and_empty_cwd(self):
+        link = self.base / "link"
+        link.symlink_to(self.worktree)
+        inside = self.process(self.worktree)
+        self.assertEqual(agent.lease_processes(link, processes=[inside]), [inside])
+        self.assertEqual(agent.lease_processes(self.worktree, processes=[self.process("")]), [])
+
+    def test_oldest_lease_is_the_longest_running_wrapper(self):
+        procs = [self.process(self.worktree, since=500.0), self.process(self.worktree, since=100.0)]
+        self.assertEqual(agent.oldest_lease(self.record(), processes=procs).since, 100.0)
+        self.assertIsNone(agent.oldest_lease(self.record(), processes=[]))
+        self.assertIsNone(agent.oldest_lease(self.record(), processes=[self.process(self.base / "x")]))
+
+    def test_scans_the_state_root_when_not_injected(self):
+        path = leaseprocs.register_process("sim", root=self.state_root, cwd=str(self.worktree))
+        self.addCleanup(leaseprocs.unregister_process, path)
+        self.assertEqual(len(agent.lease_processes(self.worktree, root=self.state_root)), 1)
+        self.assertEqual(agent.oldest_lease(self.record(), root=self.state_root).pid, os.getpid())
 
 
 if __name__ == "__main__":  # pragma: no cover

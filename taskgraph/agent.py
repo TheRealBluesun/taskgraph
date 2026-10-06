@@ -18,9 +18,9 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from . import shims
+from . import leaseprocs, shims
 from .config import Config, ModelConfig
 from .plan import Task
 from .prompt import PromptError, build_command, overlay_path, write_prompt
@@ -227,6 +227,44 @@ def stalled(log: Path | str, now: float, stall_secs: float) -> bool:
     return now - seen >= stall_secs
 
 
+def lease_processes(
+    worktree: Path | str,
+    *,
+    root: Path | str | None = None,
+    processes: Sequence[leaseprocs.LeaseProcess] | None = None,
+) -> list[leaseprocs.LeaseProcess]:
+    """Live ``taskgraph lease`` wrappers whose cwd is inside ``worktree`` (SPEC §6).
+
+    A wrapper announces itself under the state root for its whole life — while
+    it waits for a slot and while it holds one — so this is where the stall
+    watchdog finds the reason an agent's trace went quiet.  ``processes`` lets a
+    caller reuse one scan for several agents; cwd comparison resolves symlinks.
+    """
+    if processes is None:
+        processes = leaseprocs.active_processes(root)
+    base = _real(worktree)
+    return [proc for proc in processes if _inside(proc.cwd, base)]
+
+
+def oldest_lease(
+    record: AgentRecord,
+    *,
+    root: Path | str | None = None,
+    processes: Sequence[leaseprocs.LeaseProcess] | None = None,
+) -> leaseprocs.LeaseProcess | None:
+    """The longest-running live lease wrapper in ``record``'s worktree (SPEC §6).
+
+    ``None`` means no lease process explains the silence, so a stalled agent is
+    really stalled.  The oldest is the one whose age the anomaly check compares
+    against ``agent.max_lease_secs``.
+    """
+    return min(
+        lease_processes(record.worktree, root=root, processes=processes),
+        key=lambda proc: proc.since,
+        default=None,
+    )
+
+
 def startup_hang(log: Path | str, *, head_lines: int = STARTUP_LINES) -> bool:
     """Return whether the trace shows omp never got going (SPEC §6).
 
@@ -310,6 +348,21 @@ def fallback_model(record: AgentRecord, cfg: Config) -> ModelConfig | None:
     if model is None or model.fallback is None or not quota_error(record.log):
         return None
     return cfg.model(model.fallback)
+
+
+def _real(path: Path | str) -> Path:
+    """Resolve ``path`` best-effort (a missing worktree still compares fine)."""
+    try:
+        return Path(path).resolve()
+    except OSError:  # pragma: no cover - resolve() only fails on absurd paths
+        return Path(path)
+
+
+def _inside(cwd: str, base: Path) -> bool:
+    """Return whether ``cwd`` is ``base`` or below it, symlinks resolved."""
+    if not cwd:
+        return False
+    return _real(cwd).is_relative_to(base)
 
 
 def _signal_group(pgid: int, sig: int) -> None:

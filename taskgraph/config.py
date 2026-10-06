@@ -17,6 +17,7 @@ from .guard import DEFAULT_DENY_PATHS, DEFAULT_MAX_FILE_MB, DEFAULT_MAX_FILES
 # Defaults for keys SPEC §1 shows in the example but does not require.
 DEFAULT_OVERLAY = "omp-agent.yml"
 DEFAULT_STALL_SECS = 480.0
+DEFAULT_MAX_LEASE_SECS = 1800.0
 DEFAULT_RETRIES = 2
 
 _REQUIRED_ROOT_KEYS = ("plan", "prompt", "gate", "worktrees", "main")
@@ -47,6 +48,7 @@ class AgentConfig:
     command: str
     overlay: str = DEFAULT_OVERLAY
     stall_secs: float = DEFAULT_STALL_SECS
+    max_lease_secs: float = DEFAULT_MAX_LEASE_SECS
     retries: int = DEFAULT_RETRIES
     deny: tuple[str, ...] = ()
 
@@ -162,11 +164,19 @@ def _agent(raw: Any, path: Path) -> AgentConfig:
     stall_secs = _number(raw, "stall_secs", path, where="[agent] ", default=DEFAULT_STALL_SECS)
     if stall_secs <= 0:
         raise ConfigError(f"{path}: [agent] 'stall_secs' must be > 0, not {stall_secs!r}")
+    max_lease_secs = _number(
+        raw, "max_lease_secs", path, where="[agent] ", default=DEFAULT_MAX_LEASE_SECS
+    )
+    if max_lease_secs <= 0:
+        raise ConfigError(
+            f"{path}: [agent] 'max_lease_secs' must be > 0, not {max_lease_secs!r}"
+        )
     retries = _int(raw, "retries", path, where="[agent] ", default=DEFAULT_RETRIES, minimum=0)
     return AgentConfig(
         command=command,
         overlay=overlay,
         stall_secs=float(stall_secs),
+        max_lease_secs=float(max_lease_secs),
         retries=retries,
         deny=_string_list(raw, "deny", path, where="[agent] ", default=()),
     )

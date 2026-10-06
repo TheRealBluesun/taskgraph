@@ -250,6 +250,16 @@ sessions = 1
         toml = MINIMAL_TOML.replace('main = "main"', 'main = "main"\ntrailer = "x"')
         self.assert_error(toml, "trailer' must be an array of non-empty strings")
 
+    def test_max_lease_secs_must_be_a_positive_number(self):
+        self.assert_error(
+            MINIMAL_TOML.replace('command = "fake-agent', 'max_lease_secs = 0\ncommand = "fake-agent'),
+            "[agent] 'max_lease_secs' must be > 0",
+        )
+        self.assert_error(
+            MINIMAL_TOML.replace('command = "fake-agent', 'max_lease_secs = "soon"\ncommand = "fake-agent'),
+            "[agent] max_lease_secs' must be a number",
+        )
+
     def test_invalid_toml(self):
         self.assert_error("plan = [unclosed", "invalid TOML")
 
@@ -269,6 +279,7 @@ class DataclassTest(unittest.TestCase):
         agent = AgentConfig(command="omp")
         self.assertEqual(agent.overlay, "omp-agent.yml")
         self.assertEqual(agent.stall_secs, 480.0)
+        self.assertEqual(agent.max_lease_secs, 1800.0)
         self.assertEqual(agent.retries, 2)
         self.assertEqual(agent.deny, ())
 

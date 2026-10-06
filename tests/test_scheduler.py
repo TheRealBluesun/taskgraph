@@ -12,6 +12,7 @@ import contextlib
 import io
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -21,7 +22,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from taskgraph import agent, assign, cli, config, scheduler, state, worktree
+from taskgraph import agent, assign, cli, config, lease, scheduler, state, worktree
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -46,12 +47,13 @@ TOML = """\
 plan = "PLAN.md"
 prompt = "PROMPT.md"
 gate = "true"
-worktrees = "../wt"
+worktrees = "{worktrees}"
 main = "main"
-
+{resources}
 [agent]
 command = '{command}'
 stall_secs = {stall_secs}
+max_lease_secs = {max_lease_secs}
 retries = {retries}
 
 [[models]]
@@ -109,13 +111,27 @@ class ProjectTestCase(unittest.TestCase):
     def write_plan(self, text):
         (self.root / "PLAN.md").write_text(text, encoding="utf-8")
 
-    def write_toml(self, *, sessions=2, max_agents=None, stall_secs=480, retries=2):
+    def write_toml(
+        self,
+        *,
+        sessions=2,
+        max_agents=None,
+        stall_secs=480,
+        retries=2,
+        max_lease_secs=1800,
+        resources="",
+        command=None,
+        worktrees="../wt",
+    ):
         text = TOML.format(
-            command=self.script,
+            command=self.script if command is None else command,
             stall_secs=stall_secs,
             retries=retries,
+            max_lease_secs=max_lease_secs,
+            resources=resources,
             sessions=sessions,
             max_agents=sessions if max_agents is None else max_agents,
+            worktrees=worktrees,
         )
         path = self.root / "taskgraph.toml"
         path.write_text(text, encoding="utf-8")
@@ -274,6 +290,67 @@ class StallTest(ProjectTestCase):
         self.assertFalse(agent.group_alive(int(match.group(1))))
 
 
+class StallExemptTest(ProjectTestCase):
+    """A silent agent waiting for a shared resource is not stalled (SPEC §6)."""
+
+    def lease_agent(self) -> Path:
+        """A fake agent that runs the real ``taskgraph lease`` and then sleeps."""
+        lease_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(ROOT / 'bin' / 'taskgraph'))}"
+        script = self.base / "lease-agent.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            'echo "trace $(basename "$PWD")"\n'
+            f"{lease_cmd} lease sim -- sleep 30\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return script
+
+    def test_waiting_on_a_lease_keeps_the_stall_watchdog_off(self):
+        self.write_plan(PLAN_1)
+        cfg = self.load_cfg(
+            sessions=1,
+            retries=0,
+            stall_secs=2.0,
+            max_lease_secs=2.0,
+            resources="\n[resources]\nsim = 1\n",
+            command=self.lease_agent(),
+            worktrees="wt",  # inside the project, so `taskgraph lease` finds the config
+        )
+        # The worktree is a checkout of main and `taskgraph lease` reads the
+        # config from it, so main must carry the [resources] table.
+        git("add", "taskgraph.toml", cwd=self.root)
+        git("commit", "-qm", "add the simulator resource", cwd=self.root)
+        # Hold the only slot in-process: the agent's wrapper waits for it, which
+        # is exactly the silent-by-design case that was killed as "stalled".
+        held = lease.try_acquire("sim", 1, root=self.state_root, task="other")
+        self.assertIsNotNone(held)
+        self.addCleanup(lease.release, held, root=self.state_root)
+
+        # TASKGRAPH_STATE reaches the agent through the environment (the
+        # scheduler only injects `state_root` in-process), and the agent's own
+        # `taskgraph lease` must use this test's slots, not the user's.
+        with mock.patch.dict(os.environ, {"TASKGRAPH_STATE": str(self.state_root)}):
+            sched = self.make_scheduler(cfg)
+            sched.start()
+            # Fail fast on a regression: a stall kill is the opposite of the point.
+            self.pump(
+                sched,
+                lambda: any(
+                    phrase in self.events_text()
+                    for phrase in ("anomaly T01", "stall T01", "blocked T01")
+                ),
+            )
+            events = self.events_text()
+            self.assertIn("anomaly T01", events)  # lease outlived agent.max_lease_secs
+            self.assertNotIn("stall T01", events)
+            self.assertNotIn("blocked T01", events)
+            record = sched.running["T01"]
+            self.assertTrue(agent.group_alive(record.pgid))
+            agent.kill(record, timeout=5)  # the wrapper forwards SIGTERM to `sleep`
+        self.assertFalse(agent.group_alive(record.pgid))
+
+
 class ReloadTest(ProjectTestCase):
     def test_model_pool_reload_is_picked_up_and_logged(self):
         cfg = self.load_cfg(sessions=1)
@@ -312,7 +389,16 @@ class DryRunTest(unittest.TestCase):
         (self.root / "PLAN.md").write_text(PLAN_3, encoding="utf-8")
         (self.root / "PROMPT.md").write_text("rules\n", encoding="utf-8")
         (self.root / "taskgraph.toml").write_text(
-            TOML.format(command="true", stall_secs=480, retries=2, sessions=1, max_agents=1),
+            TOML.format(
+                command="true",
+                stall_secs=480,
+                retries=2,
+                max_lease_secs=1800,
+                resources="",
+                sessions=1,
+                max_agents=1,
+                worktrees="../wt",
+            ),
             encoding="utf-8",
         )
         self.cfg = config.load(self.root / "taskgraph.toml")

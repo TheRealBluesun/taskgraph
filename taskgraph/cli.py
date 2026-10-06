@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Sequence, TextIO
 
-from . import assign, control, lease, scheduler, worktree
+from . import assign, control, lease, leaseprocs, scheduler, worktree
 from .config import Config, ConfigError, load
 from .procsig import (
     GROUP_GRACE,
@@ -127,7 +127,12 @@ def run_lease(
     forwarder.install()
     previous = block_terminating_signals()
     blocked = previous is not None
+    announcement: Path | None = None
     try:
+        # Announce this wrapper before it may start waiting: while an agent's
+        # leased command runs, omp streams nothing into its trace, so the
+        # scheduler's stall watchdog must be able to see the wrapper (SPEC §6).
+        announcement = leaseprocs.register_process(resource, root=base, cmd=command)
         try:
             slot = lease.wait_for_slot(
                 resource,
@@ -178,6 +183,8 @@ def run_lease(
         finally:
             lease.release(slot, root=base)
     finally:
+        if announcement is not None:
+            leaseprocs.unregister_process(announcement)
         forwarder.restore()
         restore_mask(previous)
     return code if code >= 0 else 128 - code
