@@ -16,13 +16,12 @@ over the recent sample window (SPEC §4).
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
-from . import agent, assign, lease, order, plan, pool, state, worktree
+from . import agent, assign, lease, order, plan, pool, state, trace, worktree
 from .config import Config
 
 #: Trace markers that say a tool call is executing (SPEC §6/§9).
@@ -77,7 +76,7 @@ def format_age(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
-def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
+def table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
     """Left-align every column but the last, which is never padded."""
     widths = [max(len(row[i]) for row in (header, *rows)) for i in range(len(header) - 1)]
     return [
@@ -103,16 +102,7 @@ def format_holders(slots: Sequence[lease.Slot], now: float | None = None) -> str
         ]
         for slot in slots
     ]
-    return "\n".join(_table(header, rows))
-
-
-def _event(line: str) -> dict[str, Any] | None:
-    """Parse one trace line into an event mapping; junk lines report ``None``."""
-    try:
-        event = json.loads(line)
-    except ValueError:
-        return None
-    return event if isinstance(event, dict) else None
+    return "\n".join(table(header, rows))
 
 
 def current_tool(log: Path | str) -> str | None:
@@ -133,7 +123,7 @@ def current_tool(log: Path | str) -> str | None:
         for line in handle:
             if TOOL_START not in line and TOOL_END not in line:
                 continue
-            event = _event(line)
+            event = trace.event(line)
             if event is None:
                 continue
             kind = event.get("type")
@@ -259,7 +249,7 @@ def _section(title: str, count: int, rows: Sequence[str]) -> list[str]:
 
 def render(status: ProjectStatus, *, now: float | None = None) -> str:
     """Render ``status`` as plain text, one section per SPEC §9 entry."""
-    running = _table(
+    running = table(
         ("ID", "MODEL", "AGE", "IDLE", "TOOL"),
         [
             (
@@ -272,7 +262,7 @@ def render(status: ProjectStatus, *, now: float | None = None) -> str:
             for agent_status in status.running
         ],
     )
-    load = _table(
+    load = table(
         ("MODEL", "RUNNING", "WAITING"),
         [
             (

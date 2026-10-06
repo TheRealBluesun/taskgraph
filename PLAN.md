@@ -23,7 +23,7 @@ Do the FIRST unchecked task only. Each task: implement per SPEC.md, add/extend u
 - [x] T14 `taskgraph stop [--agents]`, `taskgraph retry <id>`; tests.
 - [x] T13b Stall exemption per SPEC §6 "stall": no stall kill while a `taskgraph lease` process with cwd inside the agent's worktree is alive; `agent.max_lease_secs` anomaly event; tests with a fake agent that runs `taskgraph lease sim -- sleep` beyond `stall_secs`.
 - [x] T15 `taskgraph status` per SPEC §9; test renders a fixture state.
-- [ ] T16 `taskgraph stats` per SPEC §9 (omp trace parsing, buckets from config); tests on a small fixture trace (copy shape from SPEC: message_end with timestamp/duration/content toolCall, tool_execution_* lines).
+- [x] T16 `taskgraph stats` per SPEC §9 (omp trace parsing, buckets from config); tests on a small fixture trace (copy shape from SPEC: message_end with timestamp/duration/content toolCall, tool_execution_* lines).
 - [ ] T17 Idle watch + anomaly events per SPEC §9 and `taskgraph models` throughput-by-concurrency table per SPEC §4; tests with injected samples.
 - [ ] T18 `examples/elixir/taskgraph.toml` + `examples/elixir/dev-sh-lease.md` (how Elixir's dev.sh switches from its lock dir to `taskgraph lease simulator -- …`); README usage section. No changes to the Elixir repo.
 - [ ] T19 Job classes per SPEC §4 "Job classes": `[models.classes]` capacities (default `{agent = sessions}`), `taskgraph side <class> -- <cmd>` leasing a model's side capacity (env `TASKGRAPH_MODEL` tells the command which model it got), preference for models whose agents are blocked on a tool; tests.

@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Sequence, TextIO
 
-from . import assign, control, lease, leaseprocs, scheduler, state, status, worktree
+from . import assign, control, lease, leaseprocs, scheduler, state, stats, status, worktree
 from .config import Config, ConfigError, load
 from .procsig import (
     GROUP_GRACE,
@@ -217,6 +217,20 @@ def _cmd_lease(args: argparse.Namespace) -> int:
     return run_lease(args.resource, args.cmd, capacity=capacity, task=args.task)
 
 
+def _cmd_stats(args: argparse.Namespace) -> int:
+    """``taskgraph stats``: split each task's wall time from its trace (SPEC §9)."""
+    config = _project_config("stats")
+    if config is None:
+        return 2
+    try:
+        window = stats.parse_window(args.since)
+    except ValueError as exc:
+        print(f"taskgraph stats: {exc}", file=sys.stderr)
+        return 2
+    print(stats.render(stats.collect(config, since=window)))
+    return 0
+
+
 def _cmd_leases(args: argparse.Namespace) -> int:
     """``taskgraph leases``: print current holders and their ages (SPEC §5)."""
     print(status.format_holders(lease.holders()))
@@ -294,6 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(command=name, func=_not_implemented)
     sub.choices["run"].set_defaults(func=_cmd_run)
     sub.choices["status"].set_defaults(func=_cmd_status)
+    sub.choices["stats"].set_defaults(func=_cmd_stats)
     sub.choices["lease"].set_defaults(func=_cmd_lease)
     sub.choices["leases"].set_defaults(func=_cmd_leases)
     sub.choices["stop"].set_defaults(func=_cmd_stop)

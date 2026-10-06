@@ -7,11 +7,13 @@ file, so the resulting :class:`Config` is easy to build in tests.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .buckets import DEFAULT_BUCKETS, OTHER
 from .guard import DEFAULT_DENY_PATHS, DEFAULT_MAX_FILE_MB, DEFAULT_MAX_FILES
 
 # Defaults for keys SPEC §1 shows in the example but does not require.
@@ -68,6 +70,29 @@ class MergeConfig:
 
 
 @dataclass(frozen=True)
+class StatsConfig:
+    """The optional ``[stats]`` table: trace time-bucket regexes (SPEC §9).
+
+    ``[stats.buckets]`` maps a bucket name to a regex.  Configured buckets are
+    matched first, in file order, then the remaining :data:`DEFAULT_BUCKETS`
+    entries (a configured name replaces the default of the same name).  ``other``
+    is reserved for tool time nothing matched.
+    """
+
+    buckets: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def patterns(self) -> tuple[tuple[str, str], ...]:
+        """Buckets in match order: configured first, then the SPEC §9 defaults."""
+        if not self.buckets:
+            return DEFAULT_BUCKETS
+        overridden = {name for name, _ in self.buckets}
+        return self.buckets + tuple(
+            (name, pattern) for name, pattern in DEFAULT_BUCKETS if name not in overridden
+        )
+
+
+@dataclass(frozen=True)
 class Config:
     """A validated ``taskgraph.toml``."""
 
@@ -83,6 +108,7 @@ class Config:
     models: tuple[ModelConfig, ...]
     trailer: tuple[str, ...] = ()
     merge: MergeConfig = MergeConfig()
+    stats: StatsConfig = StatsConfig()
 
     @property
     def root(self) -> Path:
@@ -134,6 +160,7 @@ def _build(data: Mapping[str, Any], path: Path) -> Config:
         models=_models(data.get("models"), path),
         trailer=_string_list(data, "trailer", path, where="", default=()),
         merge=_merge(data.get("merge"), path),
+        stats=_stats(data.get("stats"), path),
     )
 
 
@@ -241,6 +268,39 @@ def _merge(raw: Any, path: Path) -> MergeConfig:
         max_file_mb=max_file_mb,
         deny_paths=_string_list(raw, "deny_paths", path, where="[merge] ", default=()),
     )
+
+
+def _stats(raw: Any, path: Path) -> StatsConfig:
+    """Validate the optional ``[stats]`` table (SPEC §9 tool-time buckets).
+
+    ``[stats.buckets]`` maps a bucket name to a regex, matched in file order
+    against a tool call's command (first match wins).  ``other`` is reserved:
+    it is always the last bucket, for tool time nothing matched.
+    """
+    if raw is None:
+        return StatsConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: [stats] must be a table")
+    table = raw.get("buckets")
+    if table is None:
+        return StatsConfig()
+    if not isinstance(table, dict):
+        raise ConfigError(f"{path}: [stats] 'buckets' must be a table of regexes")
+    buckets: list[tuple[str, str]] = []
+    for name, pattern in table.items():
+        where = f"[stats.buckets] '{name}'"
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(f"{path}: [stats.buckets] names must be non-empty strings")
+        if name == OTHER:
+            raise ConfigError(f"{path}: {where} is reserved for tool time nothing matched")
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ConfigError(f"{path}: {where} must be a non-empty regex, not {pattern!r}")
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ConfigError(f"{path}: {where} is not a valid regex: {exc}") from exc
+        buckets.append((name, pattern))
+    return StatsConfig(buckets=tuple(buckets))
 
 
 def _string(

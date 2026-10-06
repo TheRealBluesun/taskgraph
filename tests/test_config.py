@@ -5,7 +5,15 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from taskgraph.config import AgentConfig, Config, ConfigError, MergeConfig, ModelConfig, load
+from taskgraph.config import (
+    AgentConfig,
+    Config,
+    ConfigError,
+    MergeConfig,
+    ModelConfig,
+    StatsConfig,
+    load,
+)
 
 # The example config from SPEC §1, verbatim (comments stripped).
 SPEC_TOML = """
@@ -173,6 +181,59 @@ class MergeConfigTest(ConfigTestBase):
         self.assert_error(
             MINIMAL_TOML.replace('main = "main"', 'main = "main"\nmerge = 3'),
             "[merge] must be a table",
+        )
+
+
+class StatsConfigTest(ConfigTestBase):
+    def test_defaults_to_the_spec_buckets(self):
+        cfg = self.load_text(MINIMAL_TOML)
+        self.assertEqual(cfg.stats, StatsConfig())
+        self.assertEqual([name for name, _ in cfg.stats.patterns], ["lease-wait", "build", "test", "wait"])
+
+    def test_buckets_are_parsed_in_file_order_and_beat_the_defaults(self):
+        toml = MINIMAL_TOML + '\n[stats.buckets]\nmigrations = "\\\\bmigrate\\\\b"\nlint = "ruff"\n'
+        cfg = self.load_text(toml)
+        self.assertEqual(cfg.stats.buckets, (("migrations", r"\bmigrate\b"), ("lint", "ruff")))
+        self.assertEqual(
+            [name for name, _ in cfg.stats.patterns],
+            ["migrations", "lint", "lease-wait", "build", "test", "wait"],
+        )
+
+    def test_a_configured_name_replaces_the_default_of_the_same_name(self):
+        cfg = self.load_text(MINIMAL_TOML + '\n[stats.buckets]\nbuild = "^gradle$"\n')
+        patterns = dict(cfg.stats.patterns)
+        self.assertEqual(patterns["build"], "^gradle$")
+        self.assertEqual(
+            [name for name, _ in cfg.stats.patterns], ["build", "lease-wait", "test", "wait"]
+        )
+
+    def test_invalid_regex_is_rejected(self):
+        self.assert_error(
+            MINIMAL_TOML + '\n[stats.buckets]\nbad = "([unclosed"\n',
+            "[stats.buckets] 'bad' is not a valid regex",
+        )
+
+    def test_bucket_value_must_be_a_regex_string(self):
+        self.assert_error(
+            MINIMAL_TOML + "\n[stats.buckets]\nbuild = 3\n",
+            "[stats.buckets] 'build' must be a non-empty regex",
+        )
+
+    def test_other_is_reserved(self):
+        self.assert_error(
+            MINIMAL_TOML + '\n[stats.buckets]\nother = "x"\n',
+            "[stats.buckets] 'other' is reserved",
+        )
+
+    def test_buckets_must_be_a_table(self):
+        self.assert_error(
+            MINIMAL_TOML + '\n[stats]\nbuckets = ["build"]\n',
+            "[stats] 'buckets' must be a table",
+        )
+
+    def test_stats_must_be_a_table(self):
+        self.assert_error(
+            MINIMAL_TOML.replace('main = "main"', 'main = "main"\nstats = 3'), "[stats] must be a table"
         )
 
 
