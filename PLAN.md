@@ -1,0 +1,23 @@
+# taskgraph — PLAN
+
+Do the FIRST unchecked task only. Each task: implement per SPEC.md, add/extend unit tests, run
+`python3 -m unittest discover -s tests -q` until green, then tick the task and add PROGRESS.md notes.
+
+- [ ] T01 Skeleton: package `taskgraph/` (`__init__.py`, `cli.py` with argparse subcommands from SPEC §10 that print "not implemented" for now), `bin/taskgraph`, `tests/` with one passing smoke test, README.md (5–10 lines: what it is, how to run tests).
+- [ ] T02 Config loader per SPEC §1 (`taskgraph/config.py`, dataclasses, validation errors name the key and file); tests incl. the example toml from SPEC and two invalid configs.
+- [ ] T03 Plan parser + `mark_done` per SPEC §2 (`taskgraph/plan.py`); tests: tags, done/undone, ids with suffix letter, unrelated lines untouched by mark_done.
+- [ ] T04 Ordering per SPEC §3 (`taskgraph/order.py`, pure): critical path, started-first callable, plan order, cycle safety; tests with a small graph where the critical-path task is last in plan order.
+- [ ] T05 Metrics parsing per SPEC §4 (`taskgraph/metrics.py`): parse Prometheus text (running, waiting, generation_tokens_total; multiple series summed), `sample(url)` with urllib returning None on errors; tests on fixture text (no network).
+- [ ] T06 Model pool policy per SPEC §4 (`taskgraph/pool.py`, pure): `choose_model` incl. over-session rule, 180 s spacing, and the throughput-peak veto; table-driven tests.
+- [ ] T07 Leases per SPEC §5 (`taskgraph/lease.py` + `taskgraph lease` / `taskgraph leases`): atomic slot files, stale detection (dead pid or non-lease process), waiting messages, signal forwarding, audit log; tests with capacity 1 and 2 using short `sleep` children and a temp TASKGRAPH_STATE.
+- [ ] T08 Deny shims per SPEC §5 (`taskgraph/shims.py`): create shims, real-binary resolution skipping the shim dir, allowed only with TASKGRAPH_LEASE; tests with a fake command in a temp dir.
+- [ ] T09 State file per SPEC §7 (`taskgraph/state.py`): atomic save/load, single-instance lock, process start-time check helper; tests incl. a stale lock from a dead pid.
+- [ ] T10 Agent runner per SPEC §6 (`taskgraph/agent.py`): prompt file (+ resume note, git-excluded), detached launch, poll, stall + startup-hang watchdogs, process-group kill; tests with a fake agent script (writes a trace, sleeps, exits) instead of omp; ship `share/omp-agent.yml`.
+- [ ] T11 Worktree manager (`taskgraph/worktree.py`): create (branch task/<id> from main, links symlinked), detect resume, remove; tests in a temp git repo.
+- [ ] T12 Merge queue per SPEC §8 (`taskgraph/merge.py`): worker thread, commit/rebase/gate/ff-merge/tick/notes/cleanup, conflict + gate-failure blocking, "main moved" retry; tests in a temp git repo with a trivial gate (`true` / `false`).
+- [ ] T13 Scheduler loop (`taskgraph/scheduler.py` + `taskgraph run`, `--dry-run`): tick every 20 s (configurable for tests), adopt live agents from state on start, retries, merge queue hand-off, events log per SPEC §9; integration test: temp repo with 3 tasks (one dependent), fake agents, capacity 2 — all merge in the right order; a second test kills the scheduler mid-run and restarts it — agents are adopted, not restarted.
+- [ ] T14 `taskgraph stop [--agents]`, `taskgraph retry <id>`; tests.
+- [ ] T15 `taskgraph status` per SPEC §9; test renders a fixture state.
+- [ ] T16 `taskgraph stats` per SPEC §9 (omp trace parsing, buckets from config); tests on a small fixture trace (copy shape from SPEC: message_end with timestamp/duration/content toolCall, tool_execution_* lines).
+- [ ] T17 Idle watch + anomaly events per SPEC §9 and `taskgraph models` throughput-by-concurrency table per SPEC §4; tests with injected samples.
+- [ ] T18 `examples/elixir/taskgraph.toml` + `examples/elixir/dev-sh-lease.md` (how Elixir's dev.sh switches from its lock dir to `taskgraph lease simulator -- …`); README usage section. No changes to the Elixir repo.
