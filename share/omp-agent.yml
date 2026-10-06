@@ -1,0 +1,9 @@
+# taskgraph's default omp overlay (SPEC §6), passed to agents via --config.
+# In print mode an agent whose long command got auto-backgrounded can end its
+# turn while the job runs, and omp exits — losing the task.
+bash:
+  autoBackground:
+    enabled: false
+eval:
+  autoBackground:
+    enabled: false
