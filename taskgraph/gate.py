@@ -1,29 +1,29 @@
-"""Admission control and streaming relay for the request router (SPEC §11).
+"""Admission control for the request router (SPEC §11).
 
 :mod:`taskgraph.router` owns *policy* — which worker a request should go to;
-this module owns the mechanics: one runtime :class:`Worker` per configured
-backend, the FIFO admission queue, the per-worker request accounting behind
-``/router/stats``, and a forwarder that relays an upstream response chunk by
-chunk instead of buffering it (agents stream their completions, and a buffered
-relay would turn every token into a stall).
+:mod:`taskgraph.relay` owns the conversation with a worker once a request has a
+slot.  This module owns the queue between the two: one runtime :class:`Worker`
+per configured backend, admission in ``(priority, arrival)`` order, and the
+per-worker accounting behind ``/router/stats``.
 
 A request is *admitted* while it holds one of its worker's ``concurrency``
-slots; requests that found no free worker wait in a single queue, served
-strictly in ``(priority, arrival)`` order, so a high-priority request is never
-overtaken (SPEC §11 "FIFO queue (by task priority, then arrival)").  Only the
-queue head is considered, and the candidate list is re-evaluated on every
-release, because which workers are free changes as requests finish.
+slots; requests that found no free worker wait in a single queue, served in
+``(priority, arrival)`` order, so a high-priority request is never overtaken
+(SPEC §11 "FIFO queue (by task priority, then arrival)").  The first waiting
+request that *can* start is admitted, not strictly the head: a request whose
+candidate workers are all busy (or all unusable) must not deadlock the ones
+behind it.  Candidate lists are re-evaluated on every release *and* on a poll
+timer, because which workers are usable changes as requests finish and as an
+``overflow`` worker's hourly cap rolls over.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Sequence
 
 from .config import WorkerConfig
 
@@ -33,27 +33,18 @@ STATS_WINDOW = 600.0
 #: Rolling window for ``max_requests_per_hour``.
 HOUR = 3600.0
 
-#: Bytes per relay read; large enough to keep big non-streaming bodies cheap.
-CHUNK = 65536
+#: How long a queued request sleeps before re-checking its candidates; bounds
+#: how late an ``overflow`` worker whose hourly cap rolled over is picked up.
+ADMIT_POLL = 1.0
 
-#: Headers of our own connection/framing that must not be copied to the other side.
-HOP_BY_HOP = frozenset(
-    {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "host",
-        "content-length",
-        "accept-encoding",
-        "expect",
-    }
-)
+#: Listen backlog for the router's HTTP server.  A full backlog makes a
+#: connecting agent wait in the kernel (or see a refused connection), so it is
+#: far larger than the maximum number of request slots.
+REQUEST_QUEUE_SIZE = 128
+
+#: Relay outcomes counted per worker (``/router/stats``); see ``relay.classify``.
+DONE = "done"
+ERROR = "error"
 
 
 class GateError(Exception):
@@ -71,6 +62,8 @@ class WorkerStats:
     in_flight: int
     queued: int
     admitted: int
+    done: int
+    errors: int
     busy_seconds: float
     utilization: float
 
@@ -90,6 +83,8 @@ class Worker:
         self.max_requests_per_hour = config.max_requests_per_hour
         self.in_flight = 0
         self.admitted = 0
+        self.done = 0
+        self.errors = 0
         self._spans: deque[tuple[float, float]] = deque()
         self._active: list[float] = []
         self._accepted: deque[float] = deque()
@@ -153,11 +148,20 @@ class Ticket:
     started: float
 
 
-@dataclass(frozen=True)
+def _never() -> bool:
+    """Default ``cancel`` for a request that cannot be withdrawn."""
+    return False
+
+
+@dataclass
 class _Pending:
     priority: int
     seq: int
     candidates: Callable[[], Sequence[Worker]]
+    cancel: Callable[[], bool] = _never
+    #: Set by :meth:`Pool._admit_one` when this request is granted a slot; the
+    #: waiting thread picks it up from its own entry (it is woken by the grant).
+    ticket: Ticket | None = None
 
     @property
     def key(self) -> tuple[int, int]:
@@ -171,8 +175,9 @@ class Pool:
     held, it returns the workers this request may use, in preference order
     (affinity first, then config priority), excluding the ones it may not use
     at all (context too large, hourly cap reached, missing api key).  The pool
-    picks the first free candidate; when none is free or the list is empty the
-    request waits.
+    picks the first waiting request (by priority, then arrival) that has a free
+    candidate; a request with nothing free waits without blocking the ones
+    behind it, and is dropped when its ``cancel`` says the client is gone.
     """
 
     def __init__(
@@ -181,9 +186,11 @@ class Pool:
         *,
         clock: Callable[[], float] = time.monotonic,
         window: float = STATS_WINDOW,
+        poll: float = ADMIT_POLL,
     ) -> None:
         self.workers = list(workers)
         self.window = window
+        self.poll = poll
         self._clock = clock
         self._cond = threading.Condition()
         self._pending: list[_Pending] = []
@@ -206,47 +213,102 @@ class Pool:
         candidates: Callable[[], Sequence[Worker]],
         *,
         timeout: float | None = None,
+        cancel: Callable[[], bool] | None = None,
     ) -> Ticket | None:
         """Wait for a free slot on a worker ``candidates()`` offers, or ``None``.
 
         ``timeout`` bounds the wait in seconds (``None`` waits for as long as
         the client does).  Requests leave the queue in ``(priority, seq)``
-        order; a request whose candidates are all full blocks the ones behind
-        it, which is what "by task priority, then arrival" means.
+        order, but the queue is *scanned*: the first waiting request that can
+        start is admitted, so one whose candidates are all busy cannot deadlock
+        the ones behind it.  The scan runs on every release and once per
+        ``poll``, so a candidate that becomes usable with time (an ``overflow``
+        worker whose hourly cap rolled over) is picked up without a wakeup.
+        ``cancel`` is consulted before admitting: a request whose client hung
+        up gives up its place instead of holding it.
         """
+        entry = _Pending(priority, seq, candidates, cancel or _never)
         with self._cond:
-            entry = _Pending(priority, seq, candidates)
             self._pending.append(entry)
             deadline = None if timeout is None else self._clock() + timeout
             try:
                 while True:
-                    head = min(self._pending, key=lambda pending: pending.key)
-                    if head is entry:
-                        for worker in candidates():
-                            if worker.free():
-                                now = self._clock()
-                                worker._take(now)
-                                self._pending.remove(entry)
-                                return Ticket(worker=worker, started=now)
-                    if deadline is not None:
+                    # ``_admit_one`` may grant the slot to *any* waiting request
+                    # (that is what keeps an unservable request from blocking
+                    # the queue), so the grant is picked up from our own entry.
+                    self._admit_one()
+                    if entry.ticket is not None:
+                        return entry.ticket
+                    if entry.cancel() or not self._queued(entry):
+                        return None
+                    if deadline is None:
+                        self._cond.wait(self.poll)
+                    else:
                         remaining = deadline - self._clock()
                         if remaining <= 0:
                             return None
-                        self._cond.wait(remaining)
-                    else:
-                        self._cond.wait()
+                        self._cond.wait(min(remaining, self.poll))
             finally:
-                if entry in self._pending:
-                    self._pending.remove(entry)
+                self._forget(entry)
+
+    def _admit_one(self) -> bool:
+        """Grant a free slot to the first waiting request that can start.
+
+        Scanning the whole queue (by priority, then arrival) is what keeps a
+        request whose candidates are all busy from deadlocking the ones behind
+        it.  A request whose client hung up is dropped instead of admitted.
+        """
+        for entry in sorted(self._pending, key=lambda pending: pending.key):
+            if entry.cancel():
+                self._forget(entry)
+                continue
+            for worker in entry.candidates():
+                if worker.free():
+                    now = self._clock()
+                    worker._take(now)
+                    entry.ticket = Ticket(worker=worker, started=now)
+                    self._forget(entry)
+                    return True
+        return False
+
+    def waiting(self) -> int:
+        """How many requests are queued right now.
+
+        Counts every queued request, including one whose candidates are all
+        unusable at the moment (an ``overflow`` worker over its hourly cap) and
+        which therefore has no worker to be attributed to in :meth:`stats`.
+        """
+        with self._cond:
+            return len(self._pending)
+
+    def _queued(self, entry: _Pending) -> bool:
+        """True while ``entry`` is still waiting (compared by identity)."""
+        return any(pending is entry for pending in self._pending)
+
+    def _forget(self, entry: _Pending) -> None:
+        """Drop ``entry`` from the queue and wake the waiters behind it."""
+        for index, pending in enumerate(self._pending):
+            if pending is entry:
+                del self._pending[index]
+                self._cond.notify_all()
+                return
 
     def release(self, ticket: Ticket) -> None:
-        """Give back the slot ``ticket`` holds and wake the head of the queue."""
+        """Give back the slot ``ticket`` holds and re-scan the queue."""
         with self._cond:
             ticket.worker._release(ticket.started, self._clock())
             self._cond.notify_all()
 
+    def record_outcome(self, worker: Worker, outcome: str) -> None:
+        """Count one relay outcome for ``/router/stats`` (``DONE``/``ERROR``)."""
+        with self._cond:
+            if outcome == DONE:
+                worker.done += 1
+            else:
+                worker.errors += 1
+
     def stats(self) -> list[WorkerStats]:
-        """Per-worker in-flight/queued/admitted/busy-seconds/utilization."""
+        """Per-worker in-flight/queued/admitted/done/errors/busy/utilization."""
         now = self._clock()
         with self._cond:
             queued = {worker.name: 0 for worker in self.workers}
@@ -263,79 +325,10 @@ class Pool:
                     in_flight=worker.in_flight,
                     queued=queued[worker.name],
                     admitted=worker.admitted,
+                    done=worker.done,
+                    errors=worker.errors,
                     busy_seconds=round(worker.busy_seconds(now, self.window), 3),
                     utilization=round(worker.utilization(now, self.window), 4),
                 )
                 for worker in self.workers
             ]
-
-
-def upstream_url(worker: Worker, path: str) -> str:
-    """The worker's upstream URL for a request path."""
-    return worker.upstream + path
-
-
-def forward(
-    worker: Worker,
-    path: str,
-    body: bytes | None,
-    headers: Mapping[str, str],
-    *,
-    timeout: float,
-):
-    """Send one request to ``worker`` and return the open upstream response.
-
-    ``urllib`` raises :class:`urllib.error.HTTPError` for a 4xx/5xx upstream
-    reply; that object *is* the response, so it is returned too — a worker's
-    error (e.g. a context-length 400) must reach the agent unchanged.
-    """
-    request = urllib.request.Request(
-        upstream_url(worker, path), data=body, headers=dict(headers), method="POST"
-    )
-    try:
-        return urllib.request.urlopen(request, timeout=timeout)
-    except urllib.error.HTTPError as exc:
-        return exc
-    except urllib.error.URLError as exc:
-        raise GateError(f"{worker.name}: upstream unreachable: {exc.reason}") from exc
-    except TimeoutError as exc:
-        # A socket timeout is an OSError, not a URLError: without this the
-        # caller would leak the request slot on a hung upstream.
-        raise GateError(f"{worker.name}: upstream timed out after {timeout:g}s") from exc
-
-
-def read_chunk(response, size: int = CHUNK) -> bytes:
-    """Read what the upstream has produced now, without waiting for ``size`` bytes.
-
-    ``read(n)`` blocks until ``n`` bytes or EOF, which would hold every SSE
-    chunk hostage to the next one; ``read1`` returns as soon as anything is
-    available.
-    """
-    read1 = getattr(response, "read1", None)
-    if read1 is not None:
-        return read1(size)
-    return response.read(size)  # pragma: no cover - http.client always has read1
-
-
-def relay(response, out, size: int = CHUNK) -> int:
-    """Stream ``response`` to the binary ``out`` as it arrives; bytes written."""
-    total = 0
-    try:
-        while True:
-            chunk = read_chunk(response, size)
-            if not chunk:
-                return total
-            out.write(chunk)
-            out.flush()
-            total += len(chunk)
-    finally:
-        response.close()
-
-
-def response_headers(response) -> list[tuple[str, str]]:
-    """The upstream headers worth forwarding (hop-by-hop framing removed)."""
-    return [
-        (name, value)
-        for name, value in response.headers.items()
-        if name.lower() not in HOP_BY_HOP
-    ]

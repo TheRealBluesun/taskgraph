@@ -8,148 +8,32 @@ dispatched to the best worker with a free slot:
    has a free slot (a cold 60k-token prefill costs 30–60 s, so keeping the
    server's prefix cache warm beats priority).
 2. else the highest-priority worker (``[[workers]]`` order) with a free slot.
-3. else wait in the FIFO queue of :class:`taskgraph.gate.Pool`.
+3. else wait in the queue of :class:`taskgraph.gate.Pool`.
 
-Agent identity is the ``X-Taskgraph-Agent`` header when present, else a hash of
-the request's first system and first user message, so an agent that cannot set
-headers still keeps its affinity.  The router rewrites the request's ``model``
-field to the worker's, injects the worker's ``Authorization`` from
-``api_key_env`` (never logged), skips a worker whose ``max_context`` is smaller
-than the estimated prompt (chars/3.5), and keeps ``overflow`` workers for when
-every local worker is full, up to their ``max_requests_per_hour``.
+Agent identity (the ``X-Taskgraph-Agent`` header, else a hash of the request's
+first system and first user message), the prompt-size estimate and the
+wait-queue priority come from :mod:`taskgraph.request`.  The router rewrites the
+request's ``model`` field to the worker's, injects the worker's ``Authorization``
+from ``api_key_env`` (never logged), skips a worker whose ``max_context`` is
+smaller than the estimate or whose api key is unset, keeps ``overflow`` workers
+for when every local worker is full (up to ``max_requests_per_hour``), and fails
+over to the next candidate when an upstream is unreachable.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import math
 import os
 import sys
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from typing import Any, Callable, Mapping, Sequence, TextIO
 
-from . import gate
-
-#: Header naming the agent behind a request (SPEC §11 "affinity").
-AGENT_HEADER = "X-Taskgraph-Agent"
-
-#: Optional header: a lower number is served sooner from the wait queue.
-PRIORITY_HEADER = "X-Taskgraph-Priority"
-
-#: Estimated prompt tokens per character of prompt text (SPEC §11).
-CHARS_PER_TOKEN = 3.5
+from . import gate, relay
+from .request import Exchange, estimate_tokens, identity, parse_json, priority, reply
 
 #: Default bound on the upstream socket operations (not on a whole stream).
 DEFAULT_UPSTREAM_TIMEOUT = 600.0
-
-
-def _header(headers: Mapping[str, str], name: str) -> str | None:
-    """Case-insensitive header lookup."""
-    wanted = name.lower()
-    for key, value in headers.items():
-        if key.lower() == wanted:
-            return value
-    return None
-
-
-def _json(body: bytes) -> Any:
-    """Parse a request body as JSON, or ``None`` when it is not an object."""
-    try:
-        parsed = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _text(content: Any) -> str:
-    """The plain text of a message content (string or list of content parts)."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            _text(part.get("text", "") if isinstance(part, dict) else part) for part in content
-        )
-    return ""
-
-
-def estimate_tokens(body: Any) -> int:
-    """Estimated prompt tokens of a request (SPEC §11: chars/3.5).
-
-    Counts the text of ``messages[].content`` plus a raw ``prompt``; a
-    non-chat body has no estimate.
-    """
-    if not isinstance(body, dict):
-        return 0
-    chars = sum(
-        len(_text(message.get("content", "")))
-        for message in body.get("messages") or ()
-        if isinstance(message, dict)
-    )
-    chars += len(_text(body.get("prompt")))
-    if chars <= 0:
-        return 0
-    return math.ceil(chars / CHARS_PER_TOKEN)
-
-
-def _first_text(body: Any, role: str) -> str:
-    """The text of the first message with ``role``, or ``""``."""
-    for message in body.get("messages") or ():
-        if isinstance(message, dict) and message.get("role") == role:
-            return _text(message.get("content", ""))
-    return ""
-
-
-def identity(headers: Mapping[str, str], body: bytes) -> str:
-    """Who a request is from: the agent header, else a hash of its first messages.
-
-    The fallback keeps affinity for agents that cannot set headers: two
-    requests from the same conversation (same system + first user message)
-    hash alike.  A body that is not JSON hashes as bytes.
-    """
-    named = _header(headers, AGENT_HEADER)
-    if named and named.strip():
-        return named.strip()
-    parsed = _json(body)
-    if parsed is None:
-        payload = body
-    else:
-        canon = json.dumps(
-            [_first_text(parsed, "system"), _first_text(parsed, "user")],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        payload = canon.encode("utf-8")
-    return "anon:" + hashlib.sha256(payload).hexdigest()[:16]
-
-
-def priority(headers: Mapping[str, str]) -> int:
-    """The wait-queue priority from ``X-Taskgraph-Priority`` (lower = sooner)."""
-    raw = _header(headers, PRIORITY_HEADER)
-    if raw is None:
-        return 0
-    try:
-        return int(raw.strip())
-    except ValueError:
-        return 0
-
-
-def error_body(status: int, message: str, kind: str = "invalid_request_error") -> bytes:
-    """An OpenAI-shaped error body."""
-    return json.dumps({"error": {"message": message, "type": kind}}).encode("utf-8")
-
-
-@dataclass
-class Exchange:
-    """One proxied request: the reply to send, and the slot to release after."""
-
-    status: int
-    headers: list[tuple[str, str]]
-    response: Any | None = None
-    body: bytes = b""
-    ticket: gate.Ticket | None = None
-    worker: gate.Worker | None = None
 
 
 class Router:
@@ -208,19 +92,40 @@ class Router:
             return False
         return True
 
+    def _serveable(self, tokens: int) -> bool:
+        """True when some worker could *ever* serve this request (SPEC §11).
+
+        A missing api key or a too-small ``max_context`` makes a worker useless
+        for this request forever, so the request is answered 503 at once
+        instead of queueing behind a slot that will never come.  An hourly cap
+        only makes it wait: the cap rolls over.
+        """
+        for worker in self.pool.workers:
+            if worker.api_key_env is None or os.environ.get(worker.api_key_env):
+                if worker.fits(tokens):
+                    return True
+            else:
+                self.api_key(worker)  # log the missing-key warning once
+        return False
+
     def _candidates(
-        self, affinity: str | None, tokens: int
+        self, affinity: str | None, tokens: int, tried: set[str]
     ) -> Callable[[], Sequence[gate.Worker]]:
         """The preference-ordered workers for one request (SPEC §11 1 + 2).
 
         Affinity first, then config priority: local workers in configuration
         order, then ``overflow`` workers, which therefore only see traffic
-        while every local worker is full.
+        while every local worker is full.  Workers already ``tried`` (an
+        unreachable upstream) are skipped by the failover loop.
         """
 
         def candidates() -> Sequence[gate.Worker]:
             now = self.pool.now()
-            usable = [w for w in self.pool.workers if self._usable(w, tokens, now)]
+            usable = [
+                w
+                for w in self.pool.workers
+                if w.name not in tried and self._usable(w, tokens, now)
+            ]
             ordered = [w for w in usable if w.name == affinity]
             ordered += [w for w in usable if not w.overflow and w.name != affinity]
             ordered += [w for w in usable if w.overflow and w.name != affinity]
@@ -247,80 +152,138 @@ class Router:
 
     # ------------------------------------------------------------ requests
 
-    def exchange(self, path: str, headers: Mapping[str, str], body: bytes) -> Exchange:
+    def exchange(
+        self,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        *,
+        cancel: Callable[[], bool] | None = None,
+    ) -> Exchange:
         """Admit a request to a worker and send it upstream.
 
         Blocks while every worker the request may use is full; ``finish`` must
         be called once the returned response has been relayed, to free the slot.
+        ``cancel`` is consulted while the request waits, so a client that hung
+        up gives up its queue place.  An unreachable upstream fails over to the
+        next candidate; the slot is released on every failure path.
         """
-        payload = _json(body)
+        if not relay.path_ok(path):
+            return reply(400, f"invalid request path: {path!r}")
+        payload = parse_json(body)
+        if payload is None or not isinstance(payload.get("messages"), list):
+            return reply(400, "request body must be a JSON object with a 'messages' list")
         tokens = estimate_tokens(payload)
-        agent = identity(headers, body)
-        candidates = self._candidates(self.affinity(agent), tokens)
 
         if not any(worker.fits(tokens) for worker in self.pool.workers):
-            return Exchange(
-                status=413,
-                headers=[("Content-Type", "application/json")],
-                body=error_body(413, f"prompt of ~{tokens} tokens is too large for every worker"),
-            )
-        if not candidates():
-            return Exchange(
-                status=503,
-                headers=[("Content-Type", "application/json"), ("Retry-After", "30")],
-                body=error_body(
-                    503, "no worker can serve this request right now", "server_error"
-                ),
+            return reply(413, f"prompt of ~{tokens} tokens is too large for every worker")
+        if not self._serveable(tokens):
+            return reply(
+                503, "no worker can serve this request right now", "server_error", retry_after=30
             )
 
+        agent = identity(headers, body)
+        tried: set[str] = set()
+        candidates = self._candidates(self.affinity(agent), tokens, tried)
+        seq = self.pool.next_seq()
+        priority_ = priority(headers)
         timeout = self.queue_timeout if self.queue_timeout > 0 else None
-        ticket = self.pool.acquire(
-            priority(headers), self.pool.next_seq(), candidates, timeout=timeout
-        )
-        if ticket is None:
-            return Exchange(
-                status=503,
-                headers=[("Content-Type", "application/json"), ("Retry-After", "1")],
-                body=error_body(503, "all workers are busy", "server_error"),
-            )
-        self._record(agent, ticket.worker)
+        last: gate.GateError | None = None
 
-        try:
-            upstream_headers = self._forward_headers(headers, ticket.worker)
-            upstream_body = self._rewrite(payload, body, ticket.worker)
-            response = gate.forward(
-                ticket.worker,
-                path,
-                upstream_body,
-                upstream_headers,
-                timeout=self.upstream_timeout,
+        while len(tried) < len(self.pool.workers):
+            ticket = self.pool.acquire(
+                priority_, seq, candidates, timeout=timeout, cancel=cancel
             )
-        except gate.GateError as exc:
-            self.pool.release(ticket)
-            return Exchange(
-                status=502,
-                headers=[("Content-Type", "application/json")],
-                body=error_body(502, str(exc), "server_error"),
-            )
-        return Exchange(
-            status=response.status,
-            headers=gate.response_headers(response),
-            response=response,
-            ticket=ticket,
-            worker=ticket.worker,
+            if ticket is None:
+                return reply(503, "all workers are busy", "server_error", retry_after=1)
+            keep = False
+            try:
+                upstream_headers = self._forward_headers(headers, ticket.worker)
+                upstream_body = self._rewrite(payload, body, ticket.worker)
+                response = relay.forward(
+                    ticket.worker,
+                    path,
+                    upstream_body,
+                    upstream_headers,
+                    timeout=self.upstream_timeout,
+                )
+                # Affinity is recorded only once the worker accepted the
+                # request: a worker we never reached must not attract the
+                # agent's next request.
+                self._record(agent, ticket.worker)
+                keep = True
+                return Exchange(
+                    status=response.status,
+                    headers=relay.response_headers(response),
+                    response=response,
+                    ticket=ticket,
+                    worker=ticket.worker,
+                )
+            except gate.GateError as exc:
+                tried.add(ticket.worker.name)  # unreachable: try the next candidate
+                last = exc
+            except Exception as exc:
+                return reply(502, f"{ticket.worker.name}: {exc}", "server_error")
+            finally:
+                if not keep:
+                    self.pool.release(ticket)
+        return reply(
+            502,
+            str(last) if last is not None else "no worker accepted the request",
+            "server_error",
         )
 
-    def finish(self, exchange: Exchange) -> None:
-        """Release the slot an :class:`Exchange` holds (safe to call twice)."""
+    def passthrough(self, path: str, headers: Mapping[str, str]) -> Exchange:
+        """Forward a non-generation request (``GET /v1/models``) to a worker.
+
+        SPEC §11's capacity protects *generation* requests, so a listing call
+        takes no slot.  The highest-priority worker (config order) serves it,
+        failing over to the next when an upstream is unreachable.
+        """
+        if not relay.path_ok(path):
+            return reply(400, f"invalid request path: {path!r}")
+        for worker in self.pool.workers:
+            if worker.api_key_env is not None and not os.environ.get(worker.api_key_env):
+                self.api_key(worker)  # logs the missing-key warning once
+                continue
+            try:
+                response = relay.forward(
+                    worker,
+                    path,
+                    None,
+                    self._forward_headers(headers, worker),
+                    timeout=self.upstream_timeout,
+                    method="GET",
+                )
+            except gate.GateError:
+                continue
+            except Exception as exc:
+                return reply(502, f"{worker.name}: {exc}", "server_error")
+            return Exchange(
+                status=response.status,
+                headers=relay.response_headers(response),
+                response=response,
+                worker=worker,
+            )
+        return reply(503, "no worker can serve this request right now", "server_error")
+
+    def finish(self, exchange: Exchange, outcome: str = gate.DONE) -> None:
+        """Release the slot an :class:`Exchange` holds and count its outcome.
+
+        Safe to call twice (the second call counts nothing new).
+        """
         if exchange.ticket is not None:
             self.pool.release(exchange.ticket)
             exchange.ticket = None
+        if exchange.worker is not None:
+            worker, exchange.worker = exchange.worker, None
+            self.pool.record_outcome(worker, outcome)
 
     def _forward_headers(
         self, headers: Mapping[str, str], worker: gate.Worker
     ) -> dict[str, str]:
         """Transport headers for the upstream request (client framing dropped)."""
-        out = {name: value for name, value in headers.items() if name.lower() not in gate.HOP_BY_HOP}
+        out = {name: value for name, value in headers.items() if name.lower() not in relay.HOP_BY_HOP}
         key = self.api_key(worker)
         if key is not None:
             out["Authorization"] = key

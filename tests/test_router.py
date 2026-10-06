@@ -12,6 +12,7 @@ import re
 import select
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -20,11 +21,12 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from leasehelpers import BIN, wait_until
 from upstreams import FakeUpstream
 
-from taskgraph import gate, proxyserver, router
+from taskgraph import gate, proxyserver, relay, request, router
 from taskgraph.config import WorkerConfig
 
 PATH = "/v1/chat/completions"
@@ -40,33 +42,33 @@ class PureTest(unittest.TestCase):
 
     def test_estimate_tokens_is_chars_over_three_point_five(self):
         body = {"messages": [{"role": "user", "content": "a" * 35}]}
-        self.assertEqual(router.estimate_tokens(body), 10)
+        self.assertEqual(request.estimate_tokens(body), 10)
         parts = {"messages": [{"role": "user", "content": [{"type": "text", "text": "a" * 7}]}]}
-        self.assertEqual(router.estimate_tokens(parts), 2)
-        self.assertEqual(router.estimate_tokens({"prompt": "a" * 70}), 20)
-        self.assertEqual(router.estimate_tokens({}), 0)
-        self.assertEqual(router.estimate_tokens(None), 0)
+        self.assertEqual(request.estimate_tokens(parts), 2)
+        self.assertEqual(request.estimate_tokens({"prompt": "a" * 70}), 20)
+        self.assertEqual(request.estimate_tokens({}), 0)
+        self.assertEqual(request.estimate_tokens(None), 0)
 
     def test_identity_prefers_the_agent_header(self):
-        headers = {router.AGENT_HEADER.lower(): "  T01  "}
-        self.assertEqual(router.identity(headers, b'{"messages": []}'), "T01")
+        headers = {request.AGENT_HEADER.lower(): "  T01  "}
+        self.assertEqual(request.identity(headers, b'{"messages": []}'), "T01")
 
     def test_identity_hashes_the_first_system_and_user_messages(self):
         first = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]}
         same = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
                              {"role": "assistant", "content": "later"}]}
         other = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u2"}]}
-        one = router.identity({}, json.dumps(first).encode())
+        one = request.identity({}, json.dumps(first).encode())
         self.assertTrue(one.startswith("anon:"))
-        self.assertEqual(one, router.identity({}, json.dumps(same).encode()))
-        self.assertNotEqual(one, router.identity({}, json.dumps(other).encode()))
-        self.assertNotEqual(one, router.identity({}, b"not json"))
-        self.assertEqual(router.identity({}, b"not json"), router.identity({}, b"not json"))
+        self.assertEqual(one, request.identity({}, json.dumps(same).encode()))
+        self.assertNotEqual(one, request.identity({}, json.dumps(other).encode()))
+        self.assertNotEqual(one, request.identity({}, b"not json"))
+        self.assertEqual(request.identity({}, b"not json"), request.identity({}, b"not json"))
 
     def test_priority_header(self):
-        self.assertEqual(router.priority({}), 0)
-        self.assertEqual(router.priority({router.PRIORITY_HEADER: " -3 "}), -3)
-        self.assertEqual(router.priority({router.PRIORITY_HEADER: "later"}), 0)
+        self.assertEqual(request.priority({}), 0)
+        self.assertEqual(request.priority({request.PRIORITY_HEADER: " -3 "}), -3)
+        self.assertEqual(request.priority({request.PRIORITY_HEADER: "later"}), 0)
 
 
 class DirectTest(unittest.TestCase):
@@ -91,7 +93,7 @@ class DirectTest(unittest.TestCase):
         raw = body if body is not None else json.dumps(payload if payload is not None else CHAT).encode()
         sent = {"Content-Type": "application/json"}
         if agent:
-            sent[router.AGENT_HEADER] = agent
+            sent[request.AGENT_HEADER] = agent
         sent.update(headers or {})
         exchange = self.router.exchange(PATH, sent, raw)
         try:
@@ -99,16 +101,16 @@ class DirectTest(unittest.TestCase):
                 self.assertEqual(exchange.status, expect, exchange.body)
             out = io.BytesIO()
             if exchange.response is not None:
-                gate.relay(exchange.response, out)
+                relay.relay(exchange.response, out)
             return exchange.status, exchange.body + out.getvalue(), dict(exchange.headers)
         finally:
             self.router.finish(exchange)
 
     def hold(self, agent, *, path=PATH):
         """Start a request that blocks in a paused upstream; returns (thread, exchanges)."""
-        exchanges: list[router.Exchange] = []
+        exchanges: list[request.Exchange] = []
         payload = json.dumps(CHAT).encode()
-        headers = {"Content-Type": "application/json", router.AGENT_HEADER: agent}
+        headers = {"Content-Type": "application/json", request.AGENT_HEADER: agent}
 
         def run():
             exchanges.append(self.router.exchange(path, headers, payload))
@@ -246,10 +248,97 @@ class DirectTest(unittest.TestCase):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
         sock.close()
-        self.make_router([worker("off", f"http://127.0.0.1:{port}")])
+        r = self.make_router([worker("off", f"http://127.0.0.1:{port}")])
         status, body, _ = self.send(CHAT, agent="A")
         self.assertEqual(status, 502)
         self.assertIn("upstream unreachable", body.decode())
+        # A worker we never reached must not attract this agent's next request.
+        self.assertEqual(r.stats()["agents"], [])
+        self.assertEqual(r.pool.stats()[0].in_flight, 0)
+
+    def test_an_unreachable_worker_fails_over_to_the_next_candidate(self):
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        dead, live = worker("dead", f"http://127.0.0.1:{port}"), self.upstream("live")
+        r = self.make_router([dead, worker("live", live.url, model="m1")])
+        status, body, _ = self.send(CHAT, agent="A", expect=200)
+        self.assertEqual(json.loads(body)["model"], "m1")
+        self.assertEqual([path for path, _ in live.seen()], [PATH])
+        # Affinity is recorded for the worker that actually accepted it.
+        self.assertEqual(r.stats()["agents"], [{"agent": "A", "worker": "live", "switches": 0}])
+        self.assertEqual(r.pool.stats()[0].in_flight, 0)
+
+    def test_an_unexpected_forward_error_releases_the_slot(self):
+        live = self.upstream("w")
+        r = self.make_router([worker("w", live.url, concurrency=1)])
+        with mock.patch.object(relay, "forward", side_effect=ConnectionResetError("reset")):
+            status, body, _ = self.send(CHAT, agent="A")
+        self.assertEqual(status, 502)
+        self.assertIn("reset", body.decode())
+        self.assertEqual(r.pool.stats()[0].in_flight, 0)
+        self.send(CHAT, agent="A", expect=200)  # the slot is really free
+
+    def test_a_rewrite_error_releases_the_slot(self):
+        live = self.upstream("w")
+        r = self.make_router([worker("w", live.url, concurrency=1)])
+        with mock.patch.object(router.Router, "_rewrite", side_effect=ValueError("bad body")):
+            status, body, _ = self.send(CHAT, agent="A")
+        self.assertEqual(status, 502)
+        self.assertIn("bad body", body.decode())
+        self.assertEqual(r.pool.stats()[0].in_flight, 0)
+        self.assertEqual(live.seen(), [])
+
+    def test_messages_must_be_a_list(self):
+        live = self.upstream("w")
+        self.make_router([worker("w", live.url)])
+        for raw in (b"not json", b"{}", b"[]", json.dumps({"messages": "hi"}).encode()):
+            status, body, _ = self.send(body=raw)
+            self.assertEqual(status, 400, (raw, body))
+        self.assertEqual(live.seen(), [])
+
+    def test_a_non_v1_path_is_rejected(self):
+        live = self.upstream("w")
+        self.make_router([worker("w", live.url)])
+        headers = {"Content-Type": "application/json", request.AGENT_HEADER: "A"}
+        for path in ("/admin", "//evil.example/v1/x", "/v1/../../etc/passwd", "/v1/x#f", "/v1/"):
+            exchange = self.router.exchange(path, headers, json.dumps(CHAT).encode())
+            self.assertEqual(exchange.status, 400, (path, exchange.body))
+            self.router.finish(exchange)
+        self.assertEqual(live.seen(), [])
+
+    def test_get_passthrough_goes_to_the_priority_worker(self):
+        first, second = self.upstream("w0"), self.upstream("w1")
+        r = self.make_router([worker("w0", first.url), worker("w1", second.url)])
+        exchange = r.passthrough("/v1/models", {})
+        self.assertEqual(exchange.status, 200)
+        out = io.BytesIO()
+        relay.relay(exchange.response, out)
+        r.finish(exchange)
+        self.assertEqual(json.loads(out.getvalue())["object"], "list")
+        self.assertEqual([path for path, _ in first.seen()], ["/v1/models"])
+        self.assertEqual(second.seen(), [])
+        self.assertEqual(r.pool.stats()[0].in_flight, 0)  # passthrough takes no slot
+
+    def test_get_passthrough_fails_over_from_an_unreachable_worker(self):
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        live = self.upstream("w1")
+        r = self.make_router([worker("dead", f"http://127.0.0.1:{port}"), worker("w1", live.url)])
+        exchange = r.passthrough("/v1/models", {})
+        self.assertEqual(exchange.status, 200)
+        relay.relay(exchange.response, io.BytesIO())
+        r.finish(exchange)
+        self.assertEqual([path for path, _ in live.seen()], ["/v1/models"])
+
+    def test_get_passthrough_rejects_a_non_v1_path(self):
+        self.make_router([worker("w", self.upstream("w").url)])
+        exchange = self.router.passthrough("/admin", {})
+        self.assertEqual(exchange.status, 400)
+        self.router.finish(exchange)
 
     def test_queue_timeout_reports_503_and_frees_the_queue(self):
         upstream = self.upstream("w")
@@ -303,7 +392,7 @@ class HttpTest(unittest.TestCase):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         sent = {"Content-Type": "application/json"}
         if agent:
-            sent[router.AGENT_HEADER] = agent
+            sent[request.AGENT_HEADER] = agent
         sent.update(headers or {})
         body = json.dumps(payload if payload is not None else CHAT).encode()
         try:
@@ -378,6 +467,7 @@ class HttpTest(unittest.TestCase):
 
     def test_stats_endpoint(self):
         self.post(CHAT, agent="A")
+        wait_until(lambda: self.router.pool.stats()[0].done == 1)
         status, body = self.get("/router/stats")
         self.assertEqual(status, 200)
         document = json.loads(body)
@@ -388,9 +478,22 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(entry["concurrency"], 2)
         self.assertEqual(entry["admitted"], 1)
         self.assertEqual(entry["in_flight"], 0)
+        self.assertEqual(entry["done"], 1)
+        self.assertEqual(entry["errors"], 0)
         self.assertIn("busy_seconds", entry)
         self.assertIn("utilization", entry)
         self.assertEqual(document["agents"], [{"agent": "A", "worker": "w", "switches": 0}])
+
+    def test_the_server_has_a_large_accept_backlog(self):
+        self.assertEqual(proxyserver.RouterServer.request_queue_size, 128)
+        self.assertEqual(gate.REQUEST_QUEUE_SIZE, 128)
+        self.assertGreater(proxyserver.RouterServer.request_queue_size, 8)
+
+    def test_get_v1_models_is_proxied(self):
+        status, body = self.get("/v1/models")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["object"], "list")
+        self.assertEqual([path for path, _ in self.upstream.seen()], ["/v1/models"])
 
     def test_unknown_path_is_404(self):
         status, body = self.get("/nope")
@@ -401,6 +504,21 @@ class HttpTest(unittest.TestCase):
         response = self.raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n")
         self.assertIn(b"411", response.split(b"\r\n", 1)[0])
 
+    def test_a_negative_content_length_is_400(self):
+        response = self.raw(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\n"
+        )
+        self.assertIn(b"400", response.split(b"\r\n", 1)[0])
+
+    def test_an_oversized_body_is_413(self):
+        request = (
+            f"POST {PATH} HTTP/1.1\r\nHost: x\r\n"
+            f"Content-Length: {proxyserver.MAX_BODY + 1}\r\n\r\n"
+        ).encode()
+        response = self.raw(request)
+        self.assertIn(b"413", response.split(b"\r\n", 1)[0])
+        self.assertEqual(self.upstream.seen(), [])
+
     def test_chunked_request_bodies_are_rejected(self):
         request = (
             b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
@@ -409,6 +527,52 @@ class HttpTest(unittest.TestCase):
         response = self.raw(request)
         self.assertIn(b"501", response.split(b"\r\n", 1)[0])
         self.assertEqual(self.upstream.seen(), [])
+
+    def raw_post(self, agent: str) -> socket.socket:
+        """Send one request on a raw socket and leave the reply unread."""
+        body = json.dumps(CHAT).encode()
+        head = (
+            f"POST {PATH} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+            f"{request.AGENT_HEADER}: {agent}\r\nContent-Length: {len(body)}\r\n\r\n"
+        ).encode()
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        self.addCleanup(sock.close)
+        sock.sendall(head + body)
+        return sock
+
+    @staticmethod
+    def reset(sock: socket.socket) -> None:
+        """Abort the connection (RST) instead of a graceful FIN."""
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+
+    def test_a_client_reset_mid_stream_is_an_error_not_a_done(self):
+        self.upstream.pause()
+        sock = self.raw_post("A")
+        wait_until(lambda: self.router.pool.stats()[0].in_flight == 1)
+        self.reset(sock)
+        self.upstream.resume()
+        wait_until(lambda: self.router.pool.stats()[0].errors == 1)
+        stats = self.router.pool.stats()[0]
+        self.assertEqual((stats.done, stats.errors), (0, 1))
+        self.assertEqual(stats.in_flight, 0)
+
+    def test_a_queued_client_that_disconnects_does_not_hold_the_queue(self):
+        self.upstream.pause()
+        holders = [self.raw_post("H1"), self.raw_post("H2")]
+        wait_until(lambda: self.router.pool.stats()[0].in_flight == 2)
+        waiter = self.raw_post("W")
+        wait_until(lambda: self.router.pool.waiting() == 1)
+        self.reset(waiter)
+        wait_until(lambda: self.router.pool.waiting() == 0, timeout=5)
+        self.upstream.resume()
+        wait_until(lambda: len(self.upstream.seen()) == 2, timeout=5)
+        self.assertEqual(
+            [request["body"] for request in self.upstream.snapshot()],
+            [dict(CHAT, model="m"), dict(CHAT, model="m")],
+        )
+        for sock in holders:
+            sock.close()
 
 
 class CliTest(unittest.TestCase):
@@ -482,7 +646,7 @@ class CliTest(unittest.TestCase):
             "POST",
             PATH,
             body=json.dumps(CHAT).encode(),
-            headers={"Content-Type": "application/json", router.AGENT_HEADER: "T01"},
+            headers={"Content-Type": "application/json", request.AGENT_HEADER: "T01"},
         )
         response = connection.getresponse()
         self.assertEqual(response.status, 200)

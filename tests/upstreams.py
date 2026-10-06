@@ -21,6 +21,7 @@ class FakeUpstream:
         self.name = name
         self.chunks = chunks
         self.status = status
+        self.redirect_to: str | None = None
         self.requests: list[dict] = []
         self.answers: list[str] = []
         self.lock = threading.Lock()
@@ -110,6 +111,9 @@ class FakeUpstream:
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    #: Same backlog as the router: a worker's own server must accept the
+    #: connections the router opens for it.
+    request_queue_size = 128
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -130,6 +134,12 @@ class _Handler(BaseHTTPRequestHandler):
         upstream.begin()
         try:
             upstream._release.wait(timeout=30)
+            if upstream.redirect_to is not None:
+                self.send_response(302)
+                self.send_header("Location", upstream.redirect_to)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if body is not None and body.get("stream") and upstream.chunks:
                 self._stream(upstream, body)
                 return
@@ -137,6 +147,23 @@ class _Handler(BaseHTTPRequestHandler):
                 (body or {}).get("model", ""), self.headers.get("Authorization")
             )
             self.send_response(upstream.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+        finally:
+            upstream.end()
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        upstream = self.upstream
+        upstream.record(self.path, dict(self.headers), None)
+        upstream.begin()
+        try:
+            payload = json.dumps(
+                {"object": "list", "data": [{"id": "fake-model", "object": "model"}]}
+            ).encode("utf-8")
+            self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()

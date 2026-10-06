@@ -79,10 +79,17 @@ overflow = true                   # paid: only used while every local worker is 
 max_requests_per_hour = 60        # required for an overflow worker: the spend cap
 ```
 
-`GET /router/stats` reports per worker in-flight/queued/admitted/busy-seconds/utilization (last 10
-minutes), the affinity hit rate, and each agent's worker switches. `--queue-timeout SECS` makes a
-request that waited too long answer 503 instead of waiting forever (default: wait); `--port 0` picks a
-free port.
+`GET /router/stats` reports per worker in-flight/queued/admitted/done/errors/busy-seconds/utilization
+(last 10 minutes), the affinity hit rate, and each agent's worker switches. `--queue-timeout SECS`
+makes a request that waited too long answer 503 instead of waiting forever (default: wait); `--port 0`
+picks a free port.
+
+The router is a proxy, so it is also hardened like one: only `/v1/…` paths are forwarded (never a
+`//host`, a control character or a `..` segment that could rewrite the upstream target), redirects
+are not followed (an injected api key must not travel to another host), request bodies are capped at
+8 MB, `messages` must be a list, and an unreachable worker fails over to the next candidate. Other
+`/v1/…` methods (e.g. `GET /v1/models`) pass through to the highest-priority worker without taking a
+generation slot, and a queued request whose client disconnected gives up its place.
 
 ### How a task finishes
 
