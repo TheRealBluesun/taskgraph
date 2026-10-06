@@ -200,6 +200,12 @@ thread** (the scheduling loop keeps running — *why:* a 3–5 min gate inside t
 5. Tick the plan line (`mark_done`), append `## <id>` + the notes file to `PROGRESS.md` if it exists, commit
    both with the configured trailer lines, remove the worktree and branch.
 
+**Commit guard** (before step 2): block the merge — reason listing the offending paths — when the task commit adds
+more than `merge.max_files` (200) files, any single file over `merge.max_file_mb` (5 MB), or any path under a
+build/output directory (`.build/`, `build/`, `DerivedData/`, `node_modules/`, `__pycache__/`, `target/`, `dist/`,
+plus `merge.deny_paths` from the toml). *why:* a task once committed 5,833 SwiftPM build files because its
+output dir was missing from .gitignore; only a failed fast-forward stopped it reaching main.
+
 An agent that exits **without** `.done` is resumed (same worktree, resume note) up to `agent.retries` times,
 then blocked.
 
