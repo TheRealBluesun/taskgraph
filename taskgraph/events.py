@@ -6,7 +6,8 @@ Every scheduler state change appends exactly one line, shaped for
     HH:MM:SS <kind> <id> <detail>
 
 Kinds are ``start``, ``adopt``, ``retry``, ``merged``, ``blocked``, ``stall``,
-``idle`` and ``anomaly`` (SPEC §9); ``pool`` marks a model-pool reload (SPEC §4).
+``idle`` and ``anomaly`` (SPEC §9); ``pool`` marks a model-pool reload (SPEC §4)
+and ``resolved`` a conflict-resolver agent finishing a rebase (T21).
 The log lives next to ``state.json`` under ``$TASKGRAPH_STATE``, so it is shared
 by every scheduler process for the project and survives a restart.
 """

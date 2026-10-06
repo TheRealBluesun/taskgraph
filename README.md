@@ -99,6 +99,12 @@ and appends the task's notes to `PROGRESS.md`. Conflicts, a failing gate, or a h
 task (with the reason in `taskgraph status`) instead of merging it; `taskgraph retry <id>` resumes it
 from the same worktree. An agent that exits without `.done` is resumed up to `[agent] retries` times.
 
+When `[merge] resolver_prompt` names a prompt file, a rebase conflict is instead handed to one short
+resolver agent in the mid-rebase worktree — its prompt lists each conflicted hunk with both sides and
+the two commits' messages, and the rule "keep both intents" — which may only `git add` and
+`git rebase --continue`, after which the normal build and gate decide. A resolver or gate failure still
+blocks the task, and every successful resolution is logged as `resolved <id> by agent (<n> files)`.
+
 ## Tests
 
 ```

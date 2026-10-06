@@ -92,6 +92,9 @@ class MergeConfig:
     max_files: int = DEFAULT_MAX_FILES
     max_file_mb: float = DEFAULT_MAX_FILE_MB
     deny_paths: tuple[str, ...] = ()
+    #: Path (relative to the project root) of the conflict-resolver prompt; when
+    #: unset a rebase conflict blocks the merge, exactly as it did before (T21).
+    resolver_prompt: str | None = None
 
     @property
     def deny_dirs(self) -> tuple[str, ...]:
@@ -377,6 +380,7 @@ def _merge(raw: Any, path: Path) -> MergeConfig:
         max_files=max_files,
         max_file_mb=max_file_mb,
         deny_paths=_string_list(raw, "deny_paths", path, where="[merge] ", default=()),
+        resolver_prompt=_string(raw, "resolver_prompt", path, where="[merge] ", default=None),
     )
 
 

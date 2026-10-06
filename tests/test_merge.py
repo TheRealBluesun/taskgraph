@@ -13,7 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from taskgraph import merge, worktree
+from taskgraph import merge, resolve, worktree
 from taskgraph.config import AgentConfig, Config, MergeConfig, ModelConfig
 
 INITIAL_PLAN = "- [ ] T01 first task\n- [x] T00 done\n"
@@ -291,6 +291,93 @@ class FailedCommitTest(MergeTestCase):
         self.assertTrue(self.branch_exists("task/T01"))
 
 
+class ResolverMergeTest(MergeTestCase):
+    """A rebase conflict may be handed to a resolver agent (T21)."""
+
+    RESOLVE_SCRIPT = (
+        "printf 'resolved by agent\\n' > README.md\n"
+        "git add README.md\n"
+        "git rebase --continue\n"
+    )
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "RESOLVER.md").write_text("PROJECT RESOLVER RULES\n", encoding="utf-8")
+        git("add", "-A", cwd=self.root)
+        git("commit", "-qm", "resolver prompt", cwd=self.root)
+
+    def resolver(self, model="m1"):
+        return resolve.Resolver(pick_model=lambda: model)
+
+    def start_conflict(self, script, *, gate="true", resolver_prompt="RESOLVER.md"):
+        """Create ``T01``'s worktree with work that conflicts with a moved main."""
+        cfg = self.config(gate=gate)
+        cfg = replace(cfg, agent=replace(cfg.agent, command=script))
+        if resolver_prompt is not None:
+            cfg = replace(cfg, merge=MergeConfig(resolver_prompt=resolver_prompt))
+        wt = worktree.create(cfg, "T01")
+        (wt / "README.md").write_text("agent version\n", encoding="utf-8")
+        (wt / "progress").mkdir()
+        (wt / "progress" / "T01.md").write_text(NOTES, encoding="utf-8")
+        (self.root / "README.md").write_text("main version\n", encoding="utf-8")
+        git("add", "-A", cwd=self.root)
+        git("commit", "-qm", "main edit", cwd=self.root)
+        return cfg, wt
+
+    def test_resolver_merge_succeeds_and_reports_the_resolved_files(self):
+        cfg, wt = self.start_conflict(self.script("resolver.sh", self.RESOLVE_SCRIPT))
+
+        result = merge.merge(cfg, "T01", resolver=self.resolver())
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.resolved, ("README.md",))
+        self.assertEqual(result.attempts, 1)
+        self.assertEqual(
+            (self.root / "README.md").read_text(encoding="utf-8"), "resolved by agent\n"
+        )
+        self.assertIn("- [x] T01", (self.root / "PLAN.md").read_text(encoding="utf-8"))
+        self.assertIn("## T01", (self.root / "PROGRESS.md").read_text(encoding="utf-8"))
+        self.assertFalse(wt.exists())
+        self.assertFalse(self.branch_exists("task/T01"))
+
+    def test_resolver_failure_blocks_and_keeps_the_worktree(self):
+        cfg, wt = self.start_conflict(self.script("noop.sh", "exit 0\n"))
+
+        result = merge.merge(cfg, "T01", resolver=self.resolver())
+
+        self.assertFalse(result.ok)
+        self.assertIn("conflict in README.md", result.reason)
+        self.assertIn("resolver failed", result.reason)
+        self.assertEqual(result.resolved, ())
+        self.assertTrue(wt.is_dir())
+        self.assertTrue(self.branch_exists("task/T01"))
+        self.assertEqual(git("status", "--porcelain", cwd=wt).stdout, "")
+
+    def test_a_gate_failure_after_resolution_keeps_the_resolved_list(self):
+        cfg, wt = self.start_conflict(
+            self.script("resolver.sh", self.RESOLVE_SCRIPT), gate="echo boom; exit 3"
+        )
+
+        result = merge.merge(cfg, "T01", resolver=self.resolver())
+
+        self.assertFalse(result.ok)
+        self.assertIn("gate failed (3)", result.reason)
+        self.assertEqual(result.resolved, ("README.md",))
+        self.assertTrue(wt.is_dir())
+
+    def test_a_resolver_is_ignored_without_a_resolver_prompt(self):
+        script = self.script("resolver.sh", "touch ran.txt\n" + self.RESOLVE_SCRIPT)
+        cfg, wt = self.start_conflict(script, resolver_prompt=None)
+
+        result = merge.merge(cfg, "T01", resolver=self.resolver())
+
+        self.assertFalse(result.ok)
+        self.assertIn("conflict in README.md", result.reason)
+        self.assertNotIn("resolver", result.reason)
+        self.assertFalse((wt / "ran.txt").exists())
+        self.assertEqual(result.resolved, ())
+
+
 class QueueTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -348,6 +435,22 @@ class QueueTest(unittest.TestCase):
             q.join()
 
         self.assertEqual(len(q.results()), 2)
+
+    def test_the_queue_hands_its_resolver_to_merge(self):
+        seen = []
+
+        def fake(cfg, tid, *, resolver=None):
+            seen.append(resolver)
+            return merge.MergeResult(tid, True)
+
+        marker = object()
+        with mock.patch.object(merge, "merge", side_effect=fake):
+            q = merge.MergeQueue(self.cfg, resolver=marker)
+            self.addCleanup(q.stop)
+            q.enqueue("A1")
+            q.join()
+
+        self.assertIs(seen[0], marker)
 
 
 if __name__ == "__main__":

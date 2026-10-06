@@ -29,6 +29,7 @@ from taskgraph import (
     config,
     lease,
     leaseprocs,
+    merge,
     metrics,
     scheduler,
     state,
@@ -143,6 +144,7 @@ class ProjectTestCase(unittest.TestCase):
         command=None,
         worktrees="../wt",
         metrics="",
+        merge="",
     ):
         text = TOML.format(
             command=self.script if command is None else command,
@@ -155,6 +157,7 @@ class ProjectTestCase(unittest.TestCase):
             worktrees=worktrees,
             metrics=metrics,
         )
+        text += merge
         path = self.root / "taskgraph.toml"
         path.write_text(text, encoding="utf-8")
         return path
@@ -514,6 +517,80 @@ class DryRunTest(unittest.TestCase):
             rc = cli.main(["run", "--project", str(self.root), "--dry-run"])
         self.assertEqual(rc, 0, err.getvalue())
         self.assertIn("T01", out.getvalue())
+
+
+CONFLICT_AGENT = """\
+#!/bin/sh
+case "$*" in
+  *taskgraph-resolve.md*)
+    printf 'resolved\\n' > shared.txt
+    git add -A
+    git rebase --continue
+    ;;
+  *)
+    id=$(basename "$PWD")
+    printf '%s\\n' "$id" > shared.txt
+    mkdir -p progress
+    printf -- "- did %s\\n" "$id" > "progress/$id.md"
+    : > "progress/$id.done"
+    ;;
+esac
+"""
+
+
+class ResolverTest(ProjectTestCase):
+    """The pool feeds the conflict resolver and its work is logged (T21)."""
+
+    def test_the_resolver_model_comes_from_the_published_pool_view(self):
+        cfg = self.load_cfg(sessions=1)
+        sched = self.make_scheduler(cfg)
+        sched.start()
+
+        sched._publish_pool(sched._now())
+
+        self.assertEqual(sched._pick_resolver_model(), "m1")
+
+    def test_a_resolved_merge_is_logged(self):
+        cfg = self.load_cfg(sessions=1)
+        sched = self.make_scheduler(cfg)
+        sched.start()
+
+        sched._merge_result(merge.MergeResult("T01", True, resolved=("a.ex", "b.ex")))
+        sched._drain()
+
+        self.assertIn("resolved T01 by agent (2 files)", self.events_text())
+
+
+class ResolverIntegrationTest(ProjectTestCase):
+    """Two tasks change the same file; the second merge conflicts and is resolved (T21)."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "shared.txt").write_text("base\n", encoding="utf-8")
+        (self.root / "RESOLVER.md").write_text("RESOLVER RULES\n", encoding="utf-8")
+        script = self.base / "conflict-agent.sh"
+        script.write_text(CONFLICT_AGENT, encoding="utf-8")
+        script.chmod(0o755)
+        self.conflict_script = script
+        git("add", "-A", cwd=self.root)
+        git("commit", "-qm", "shared base", cwd=self.root)
+
+    def test_the_conflicting_merge_is_resolved_by_the_agent(self):
+        cfg = self.load_cfg(
+            sessions=2,
+            command=f"{shlex.quote(str(self.conflict_script))} {{prompt_file}}",
+            merge='\n[merge]\nresolver_prompt = "RESOLVER.md"\n',
+        )
+        sched = self.make_scheduler(cfg)
+        sched.start()
+        self.pump(sched, self.plan_all_done, timeout=120)
+        sched.close()
+
+        self.assertEqual((self.root / "shared.txt").read_text(encoding="utf-8"), "resolved\n")
+        events = self.events_text()
+        self.assertRegex(events, r"(?m)^\d{2}:\d{2}:\d{2} resolved T0\d by agent \(1 files\)")
+        self.assertEqual(events.count(" blocked "), 0)
+        self.assertEqual(events.count(" merged "), 2)
 
 
 if __name__ == "__main__":

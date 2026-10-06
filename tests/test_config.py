@@ -178,6 +178,17 @@ class MergeConfigTest(ConfigTestBase):
             "[merge] deny_paths' must be an array of non-empty strings",
         )
 
+    def test_resolver_prompt_defaults_to_none_and_is_parsed(self):
+        self.assertIsNone(self.load_text(MINIMAL_TOML).merge.resolver_prompt)
+        cfg = self.load_text(MINIMAL_TOML + '\n[merge]\nresolver_prompt = "RESOLVER.md"\n')
+        self.assertEqual(cfg.merge.resolver_prompt, "RESOLVER.md")
+
+    def test_resolver_prompt_must_be_a_non_empty_string(self):
+        self.assert_error(
+            MINIMAL_TOML + "\n[merge]\nresolver_prompt = 3\n",
+            "[merge] resolver_prompt' must be a non-empty string",
+        )
+
     def test_merge_must_be_a_table(self):
         self.assert_error(
             MINIMAL_TOML.replace('main = "main"', 'main = "main"\nmerge = 3'),

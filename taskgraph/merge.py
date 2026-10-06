@@ -5,8 +5,9 @@ scheduler hands that task to a :class:`MergeQueue`, whose single worker thread
 runs the five steps of SPEC §8 in order:
 
 1. stage and commit everything the agent left in the worktree;
-2. rebase the ``task/<id>`` branch onto the integration branch (a conflict
-   blocks the task with the conflicting paths);
+2. rebase the ``task/<id>`` branch onto the integration branch; a conflict is
+   handed to the configured resolver agent (T21) or blocks the task with the
+   conflicting paths;
 3. run the configured ``gate`` in the worktree (a failure blocks with the tail
    of its output);
 4. fast-forward the integration branch to ``task/<id>`` — if somebody else
@@ -15,22 +16,24 @@ runs the five steps of SPEC §8 in order:
    the worktree and branch.
 
 Merging is serialized *and* off the scheduling loop: a several-minute gate must
-not freeze scheduling (SPEC §8).  The module only invokes ``git`` and the gate
-shell command — no omp, no network.
+not freeze scheduling (SPEC §8).  The work itself is only ``git`` and the gate
+shell command; the optional conflict resolver is a separate agent command
+(:mod:`taskgraph.resolve`).
 """
 
 from __future__ import annotations
 
-import os
 import queue
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
+from . import gitcmd
 from . import guard
 from . import plan as plan_mod
+from . import resolve as resolve_mod
 from . import worktree
 from .config import Config
 
@@ -53,8 +56,9 @@ GATE_TAIL_LINES = 20
 PROGRESS_FILE = "PROGRESS.md"
 
 
-class MergeError(Exception):
-    """A merge step could not run at all (missing worktree, git missing…)."""
+#: A merge step could not run at all (missing worktree, git missing…).  The
+#: class itself lives in :mod:`taskgraph.gitcmd`, which every git call raises.
+MergeError = gitcmd.GitError
 
 
 @dataclass(frozen=True)
@@ -64,15 +68,20 @@ class MergeResult:
     ``ok`` is True once the work is on the integration branch and the plan is
     ticked.  ``reason`` explains a blocked task (conflicting paths, gate output,
     repeated "main moved"); ``attempts`` counts rebase/gate/merge cycles.
+    ``resolved`` lists the paths a conflict resolver agent fixed (T21), even
+    when a later gate failure still blocked the task.
     """
 
     id: str
     ok: bool
     reason: str = ""
     attempts: int = 1
+    resolved: tuple[str, ...] = field(default=())
 
 
-def merge(cfg: Config, tid: str) -> MergeResult:
+def merge(
+    cfg: Config, tid: str, *, resolver: resolve_mod.Resolver | None = None
+) -> MergeResult:
     """Merge task ``tid``'s worktree into the integration branch (SPEC §8).
 
     Runs in the calling thread; :class:`MergeQueue` supplies the single worker.
@@ -80,6 +89,9 @@ def merge(cfg: Config, tid: str) -> MergeResult:
     work commit, the commit guard, conflict, gate failure, main moving
     repeatedly) and keeps the worktree so ``taskgraph retry`` can resume it.
     Raises :class:`MergeError` only when a step cannot run at all.
+
+    ``resolver`` (T21), when given and ``[merge] resolver_prompt`` is set, gets
+    a chance to resolve a rebase conflict in place instead of blocking at once.
     """
     worktree_path = worktree.path(cfg, tid)
     if not worktree_path.is_dir():
@@ -93,28 +105,30 @@ def merge(cfg: Config, tid: str) -> MergeResult:
         return blocked
 
     attempts = 0
+    resolved: list[str] = []
     while True:
         attempts += 1
-        result = _rebase(cfg, tid, worktree_path, attempts)
+        result = _rebase(cfg, tid, worktree_path, attempts, resolver, resolved)
         if result is not None:
             return result
         result = _gate(cfg, tid, worktree_path, attempts)
         if result is not None:
-            return result
-        ff = _run(cfg, "merge", "--ff-only", worktree.branch(tid))
+            return replace(result, resolved=tuple(resolved))
+        ff = gitcmd.run(cfg.root, "merge", "--ff-only", worktree.branch(tid))
         if ff.returncode == 0:
             break
         if attempts >= MAX_ATTEMPTS:
-            detail = _tail(ff.stderr or ff.stdout, 1) or f"exit {ff.returncode}"
+            detail = gitcmd.tail(ff.stderr or ff.stdout, 1) or f"exit {ff.returncode}"
             return MergeResult(
-                tid, False, f"main moved {attempts} times; {detail}", attempts
+                tid, False, f"main moved {attempts} times; {detail}", attempts,
+                resolved=tuple(resolved),
             )
         # Somebody merged in the window between our rebase and this fast-forward:
         # run the rebase/gate cycle again against the new integration branch.
 
     _finish(cfg, tid, worktree_path)
     worktree.remove(cfg, tid)
-    return MergeResult(tid, True, attempts=attempts)
+    return MergeResult(tid, True, attempts=attempts, resolved=tuple(resolved))
 
 
 # --------------------------------------------------------------------------- steps
@@ -130,15 +144,15 @@ def _commit_work(cfg: Config, tid: str, worktree_path: Path) -> MergeResult | No
     survives for ``taskgraph retry``.
     """
     worktree.exclude(worktree_path, "logs/")
-    added = _run(cfg, "add", "-A", cwd=worktree_path)
+    added = gitcmd.run(worktree_path, "add", "-A")
     if added.returncode != 0:
-        detail = _tail(added.stderr or added.stdout, 1)
+        detail = gitcmd.tail(added.stderr or added.stdout, 1)
         return MergeResult(tid, False, f"git add -A failed: {detail}")
-    if not _staged(cfg, worktree_path):
+    if not gitcmd.staged(worktree_path):
         return None
-    commit = _run(cfg, "commit", "-q", "-m", WORK_COMMIT.format(id=tid), cwd=worktree_path)
+    commit = gitcmd.run(worktree_path, "commit", "-q", "-m", WORK_COMMIT.format(id=tid))
     if commit.returncode != 0:
-        detail = _tail(commit.stderr or commit.stdout, 1)
+        detail = gitcmd.tail(commit.stderr or commit.stdout, 1)
         return MergeResult(tid, False, f"git commit failed: {detail}")
     return None
 
@@ -150,7 +164,7 @@ def _guard(cfg: Config, tid: str, worktree_path: Path) -> MergeResult | None:
     commit: a blocked task keeps its earlier commit, so a retry that adds
     nothing must still be checked against the whole branch.
     """
-    added, sizes = _changed(cfg, worktree_path)
+    added, sizes = gitcmd.changed(cfg.main, worktree_path)
     issues = guard.problems(
         added,
         sizes,
@@ -163,43 +177,36 @@ def _guard(cfg: Config, tid: str, worktree_path: Path) -> MergeResult | None:
     )
 
 
-def _changed(cfg: Config, worktree_path: Path) -> tuple[list[str], dict[str, int]]:
-    """Return the added paths and present-path byte sizes over ``cfg.main``.
+def _rebase(
+    cfg: Config,
+    tid: str,
+    worktree_path: Path,
+    attempts: int,
+    resolver: resolve_mod.Resolver | None,
+    resolved: list[str],
+) -> MergeResult | None:
+    """Step 2: rebase onto ``cfg.main``; a conflict is resolved or returned.
 
-    The work commit was just made from this worktree, so on-disk sizes match
-    it; a path that vanished (deleted, broken link) is skipped, never guessed.
+    With a resolver configured the rebase is left in progress for the agent to
+    finish; ``resolved`` gains the paths it fixed (T21).  Without one, or after
+    a resolver failure, the rebase is aborted and the task blocked with the
+    conflicting paths.
     """
-    result = _run(
-        cfg, "diff", "--name-status", "--no-renames", f"{cfg.main}...HEAD", cwd=worktree_path
-    )
-    if result.returncode != 0:
-        return [], {}
-    added: list[str] = []
-    sizes: dict[str, int] = {}
-    for line in result.stdout.splitlines():
-        fields = line.split("\t")
-        if len(fields) < 2 or not fields[0].strip():
-            continue
-        status, path = fields[0][:1], fields[-1]
-        if status not in ("A", "M", "R", "C", "T"):
-            continue  # a deletion is not a size or path offence
-        if status == "A":
-            added.append(path)
-        try:
-            sizes[path] = os.lstat(worktree_path / path).st_size
-        except OSError:
-            continue
-    return added, sizes
-
-
-def _rebase(cfg: Config, tid: str, worktree_path: Path, attempts: int) -> MergeResult | None:
-    """Step 2: rebase onto ``cfg.main``; return a blocked result on conflict."""
-    result = _run(cfg, "rebase", cfg.main, cwd=worktree_path)
+    result = gitcmd.run(worktree_path, "rebase", cfg.main)
     if result.returncode == 0:
         return None
-    conflicts = _conflicts(cfg, worktree_path)
-    _run(cfg, "rebase", "--abort", cwd=worktree_path)
+    conflicts = gitcmd.conflicts(worktree_path)
     where = ", ".join(conflicts) if conflicts else "unknown files"
+    if resolver is not None and cfg.merge.resolver_prompt:
+        outcome = resolver.resolve(cfg, tid, worktree_path, conflicts)
+        if outcome.ok:
+            resolved.extend(outcome.files)
+            return None
+        gitcmd.run(worktree_path, "rebase", "--abort")
+        return MergeResult(
+            tid, False, f"conflict in {where}; resolver failed: {outcome.reason}", attempts
+        )
+    gitcmd.run(worktree_path, "rebase", "--abort")
     return MergeResult(tid, False, f"conflict in {where}", attempts)
 
 
@@ -225,7 +232,7 @@ def _gate(cfg: Config, tid: str, worktree_path: Path, attempts: int) -> MergeRes
         output = log.read_text(encoding="utf-8", errors="replace")
     except OSError:
         output = ""
-    summary = "; ".join(_tail(output, GATE_TAIL_LINES).splitlines())
+    summary = "; ".join(gitcmd.tail(output, GATE_TAIL_LINES).splitlines())
     return MergeResult(tid, False, f"gate failed ({result.returncode}): {summary}", attempts)
 
 
@@ -235,11 +242,11 @@ def _finish(cfg: Config, tid: str, worktree_path: Path) -> None:
     changed += _append_notes(cfg, tid)
     if not changed:
         return
-    _git(cfg, "add", "--", *changed, cwd=cfg.root)
+    gitcmd.git(cfg.root, "add", "--", *changed)
     message = META_COMMIT.format(id=tid)
     if cfg.trailer:
         message += "\n\n" + "\n".join(cfg.trailer)
-    _git(cfg, "commit", "-q", "-m", message, cwd=cfg.root)
+    gitcmd.git(cfg.root, "commit", "-q", "-m", message)
 
 
 def _tick_plan(cfg: Config, tid: str) -> list[str]:
@@ -300,9 +307,15 @@ class MergeQueue:
     blocked :class:`MergeResult`, so one bad task can never kill the worker.
     """
 
-    def __init__(self, cfg: Config, on_result: Callable[[MergeResult], None] | None = None):
+    def __init__(
+        self,
+        cfg: Config,
+        on_result: Callable[[MergeResult], None] | None = None,
+        resolver: resolve_mod.Resolver | None = None,
+    ):
         self._cfg = cfg
         self._on_result = on_result
+        self._resolver = resolver
         self._queue: "queue.Queue[str | None]" = queue.Queue()
         self._lock = threading.Lock()
         self._pending: list[str] = []
@@ -348,7 +361,10 @@ class MergeQueue:
                 with self._lock:
                     self._pending.remove(tid)
                 try:
-                    result = merge(self._cfg, tid)
+                    if self._resolver is None:
+                        result = merge(self._cfg, tid)
+                    else:
+                        result = merge(self._cfg, tid, resolver=self._resolver)
                 except Exception as exc:  # never let the worker die on one task
                     result = MergeResult(tid, False, f"merge error: {exc}")
                 with self._lock:
@@ -360,45 +376,3 @@ class MergeQueue:
                         pass
             finally:
                 self._queue.task_done()
-
-
-# --------------------------------------------------------------------------- git
-
-
-def _run(cfg: Config, *args: str, cwd: Path | str | None = None) -> subprocess.CompletedProcess:
-    """Run ``git args`` in ``cwd`` (default: project root) without raising."""
-    try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=os.fspath(cwd or cfg.root),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise MergeError("git: executable not found") from exc
-
-
-def _git(cfg: Config, *args: str, cwd: Path | str | None = None) -> subprocess.CompletedProcess:
-    """Run ``git args``, raising :class:`MergeError` with git's message on failure."""
-    result = _run(cfg, *args, cwd=cwd)
-    if result.returncode != 0:
-        raise MergeError(f"git {' '.join(args)}: {_tail(result.stderr or result.stdout, 1)}")
-    return result
-
-
-def _staged(cfg: Config, cwd: Path) -> bool:
-    """Return whether the index has any change to commit."""
-    return _run(cfg, "diff", "--cached", "--quiet", cwd=cwd).returncode != 0
-
-
-def _conflicts(cfg: Config, cwd: Path) -> list[str]:
-    """Return the unmerged paths left by a failed rebase."""
-    result = _run(cfg, "diff", "--name-only", "--diff-filter=U", cwd=cwd)
-    return [line for line in result.stdout.splitlines() if line.strip()]
-
-
-def _tail(text: str, lines: int) -> str:
-    """Return the last ``lines`` non-empty lines of ``text`` joined by newlines."""
-    kept = [line for line in (text or "").splitlines() if line.strip()]
-    return "\n".join(kept[-lines:])

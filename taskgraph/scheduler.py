@@ -27,7 +27,20 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from . import agent, assign, events, idle, merge, metrics, order, plan, pool, state, worktree
+from . import (
+    agent,
+    assign,
+    events,
+    idle,
+    merge,
+    metrics,
+    order,
+    plan,
+    pool,
+    resolve,
+    state,
+    worktree,
+)
 from .config import Config, ConfigError
 from .config import load as config_load
 
@@ -91,7 +104,14 @@ class Scheduler:
         self.idle = idle.IdleWatch()
         self._results: list[merge.MergeResult] = []
         self._result_lock = threading.Lock()
-        self.queue = merge.MergeQueue(cfg, on_result=self._merge_result)
+        # The merge worker may need a model for a conflict resolver (T21); it
+        # runs off this loop, so it reads a snapshot published every tick.
+        self._resolver = resolve.Resolver(pick_model=self._pick_resolver_model)
+        self._pool_lock = threading.Lock()
+        self._pool_view: tuple[
+            Mapping[str, int], Mapping[str, list[pool.Sample]], Mapping[str, float], float
+        ] = ({}, {}, {}, 0.0)
+        self.queue = merge.MergeQueue(cfg, on_result=self._merge_result, resolver=self._resolver)
 
         self._lock: state.Lock | None = None
         self._started = False
@@ -180,6 +200,7 @@ class Scheduler:
         self._idle_watch(now)
         if not self._stopping:
             self._fill(now)
+        self._publish_pool(now)
         self._save()
 
     def _reload(self) -> None:
@@ -231,6 +252,12 @@ class Scheduler:
             results, self._results = self._results, []
         for result in results:
             self.merging.discard(result.id)
+            if result.resolved:
+                self._event(
+                    "resolved",
+                    result.id,
+                    f"by agent ({len(result.resolved)} files)",
+                )
             if result.ok:
                 self.state.blocked.pop(result.id, None)
                 self.state.retries.pop(result.id, None)
@@ -292,8 +319,8 @@ class Scheduler:
     def _on_exit(self, record: agent.AgentRecord) -> None:
         """An agent process ended: merge when done, else retry or block (SPEC §8)."""
         if worktree.done_path(self.cfg, record.id).is_file():
-            self._enqueue(record.id)
             self.running.pop(record.id, None)
+            self._enqueue(record.id)
             return
         self._requeue(record, "exited without progress/<id>.done")
 
@@ -313,10 +340,16 @@ class Scheduler:
         self._event("retry", tid, f"{detail} (attempt {record.retries + 1}/{self.cfg.agent.retries})")
 
     def _enqueue(self, tid: str) -> None:
-        """Hand ``tid`` to the merge worker once (idempotent)."""
+        """Hand ``tid`` to the merge worker once (idempotent).
+
+        The pool snapshot is refreshed before the id reaches the worker, so a
+        conflict resolver started for it never sees this task's just-exited
+        agent as occupying a slot (T21).
+        """
         if tid in self.merging:
             return
         self.merging.add(tid)
+        self._publish_pool(self._now())
         self.queue.enqueue(tid)
 
     def _fill(self, now: float) -> None:
@@ -359,6 +392,27 @@ class Scheduler:
         if forced is not None:
             models = tuple(model for model in models if model.name == forced)
         return assign.choose(models, assigned, self.history, now, self.state.last_extra)
+
+    def _publish_pool(self, now: float) -> None:
+        """Publish an immutable pool snapshot for the resolver (T21).
+
+        The conflict resolver runs in the merge worker thread, which must not
+        read the live ``running``/``history`` while this loop mutates them.
+        """
+        view = (
+            dict(Counter(record.model for record in self.running.values())),
+            {name: list(samples) for name, samples in self.history.items()},
+            dict(self.state.last_extra),
+            now,
+        )
+        with self._pool_lock:
+            self._pool_view = view
+
+    def _pick_resolver_model(self) -> str | None:
+        """Choose a model for a conflict resolver from the published view (T21)."""
+        with self._pool_lock:
+            assigned, history, last_extra, now = self._pool_view
+        return assign.choose(self.cfg.models, assigned, history, now, dict(last_extra))
 
     def _start(self, task: plan.Task, name: str, assigned: Counter, now: float) -> None:
         """Create the worktree if needed and launch the task's agent."""

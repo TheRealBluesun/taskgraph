@@ -86,6 +86,10 @@ max_requests_per_hour = 60                  # required for an overflow worker: t
 # .build/ build/ DerivedData/ node_modules/ __pycache__/ target/ dist/.
 [merge]
 deny_paths = ["playtest-results"]           # the harness writes JSON here; it must never reach main
+# Optional: a rebase conflict runs one short resolver agent in the worktree instead of blocking
+# the task outright. The file holds the project's resolver instructions; taskgraph adds each
+# conflicted hunk with both sides, the two commits' messages and the "keep both intents" rule.
+# resolver_prompt = "RESOLVER.md"
 
 # `taskgraph stats` buckets tool time by the *first* tool call's command (SPEC §9). Configured
 # buckets are matched first, then the defaults (lease-wait, build, test, wait) still apply.
