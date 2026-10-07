@@ -22,15 +22,12 @@ from typing import Mapping, Sequence
 
 from . import agent, plan, status, trace, worktree
 from .buckets import bucket_for, bucket_names
+from .duration import format_seconds as format_window
+from .duration import parse_seconds as parse_window
 from .trace import Call, Message
 
 #: ``<id>-<HHMMSS>.log``, as written by :func:`taskgraph.agent.start` (SPEC §6).
 TRACE_NAME = re.compile(r"^(?P<id>[A-Za-z][A-Za-z0-9]*)-(?P<clock>\d{6})\.log$")
-
-#: ``--since`` window units (SPEC §10).
-WINDOW_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
-
-_WINDOW_RE = re.compile(r"(\d+(?:\.\d+)?)([smhd]?)")
 
 
 # ------------------------------------------------------------------- messages
@@ -211,31 +208,6 @@ def totals(snapshot: Stats) -> TaskStats:
         tool=sum(task.tool for task in snapshot.tasks),
         buckets=buckets,
     )
-
-
-# ---------------------------------------------------------------------- window
-
-
-def parse_window(text: str) -> float:
-    """Parse a ``--since`` window (``90s``, ``30m``, ``6h``, ``2d``) into seconds.
-
-    A bare number counts seconds.  Raises :class:`ValueError` on anything else.
-    """
-    match = _WINDOW_RE.fullmatch(text.strip().lower())
-    if match is None:
-        raise ValueError(f"invalid window {text!r} (use e.g. 90s, 30m, 6h, 2d)")
-    return float(match.group(1)) * WINDOW_UNITS[match.group(2) or "s"]
-
-
-def format_window(seconds: float | None) -> str:
-    """Render a window for a message: ``all time``, ``6h``, ``90s``."""
-    if seconds is None:
-        return "all time"
-    for unit in ("d", "h", "m"):
-        size = WINDOW_UNITS[unit]
-        if seconds >= size and seconds % size == 0:
-            return f"{int(seconds // size)}{unit}"
-    return f"{seconds:g}s"
 
 
 # --------------------------------------------------------------------- collect

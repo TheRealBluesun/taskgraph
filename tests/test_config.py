@@ -11,6 +11,7 @@ from taskgraph.config import (
     ConfigError,
     MergeConfig,
     ModelConfig,
+    SchedulerConfig,
     StatsConfig,
     WorkerConfig,
     load,
@@ -193,6 +194,48 @@ class MergeConfigTest(ConfigTestBase):
         self.assert_error(
             MINIMAL_TOML.replace('main = "main"', 'main = "main"\nmerge = 3'),
             "[merge] must be a table",
+        )
+
+
+class SchedulerConfigTest(ConfigTestBase):
+    def test_defaults_to_20_minutes(self):
+        cfg = self.load_text(MINIMAL_TOML)
+        self.assertEqual(cfg.scheduler, SchedulerConfig())
+        self.assertEqual(cfg.scheduler.upgrade_window, 1200.0)
+
+    def test_upgrade_window_accepts_durations_and_seconds(self):
+        for value, expected in (('"20m"', 1200.0), ('"90s"', 90.0), ('"1.5h"', 5400.0), ("30", 30.0)):
+            with self.subTest(value=value):
+                cfg = self.load_text(MINIMAL_TOML + f"\n[scheduler]\nupgrade_window = {value}\n")
+                self.assertEqual(cfg.scheduler.upgrade_window, expected)
+
+    def test_zero_disables_upgrading(self):
+        cfg = self.load_text(MINIMAL_TOML + "\n[scheduler]\nupgrade_window = 0\n")
+        self.assertEqual(cfg.scheduler.upgrade_window, 0.0)
+
+    def test_bad_duration_names_the_key_and_file(self):
+        err = self.assert_error(
+            MINIMAL_TOML + '\n[scheduler]\nupgrade_window = "later"\n',
+            "'[scheduler] upgrade_window' must be a duration",
+        )
+        self.assertIn("taskgraph.toml", str(err))
+
+    def test_negative_window_is_rejected(self):
+        self.assert_error(
+            MINIMAL_TOML + "\n[scheduler]\nupgrade_window = -1\n",
+            "[scheduler] upgrade_window' must be >= 0",
+        )
+
+    def test_bool_is_not_a_duration(self):
+        self.assert_error(
+            MINIMAL_TOML + "\n[scheduler]\nupgrade_window = true\n",
+            "'[scheduler] upgrade_window' must be a duration",
+        )
+
+    def test_scheduler_must_be_a_table(self):
+        self.assert_error(
+            MINIMAL_TOML.replace('main = "main"', 'main = "main"\nscheduler = 3'),
+            "[scheduler] must be a table",
         )
 
 

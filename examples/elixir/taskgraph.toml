@@ -82,6 +82,12 @@ api_key_env = "DEEPSEEK_API_KEY"            # Authorization: Bearer $DEEPSEEK_AP
 overflow = true                             # paid: only used while every local worker is full
 max_requests_per_hour = 60                  # required for an overflow worker: the spend cap
 
+# Scheduler tuning (SPEC §7). When the top-priority model frees an agent slot and nothing is queued
+# for it, one running agent on a lower tier that started at most this long ago is restarted there
+# through the same worktree — critical path first, once per task. `0` disables upgrading.
+[scheduler]
+upgrade_window = "20m"
+
 # Refuse a merge commit that looks like a build dump (SPEC §8). The defaults already block
 # .build/ build/ DerivedData/ node_modules/ __pycache__/ target/ dist/.
 [merge]

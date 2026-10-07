@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import duration
 from .buckets import DEFAULT_BUCKETS, OTHER
 from .guard import DEFAULT_DENY_PATHS, DEFAULT_MAX_FILE_MB, DEFAULT_MAX_FILES
 
@@ -21,6 +22,10 @@ DEFAULT_OVERLAY = "omp-agent.yml"
 DEFAULT_STALL_SECS = 480.0
 DEFAULT_MAX_LEASE_SECS = 1800.0
 DEFAULT_RETRIES = 2
+
+#: How young a running agent must be to be restarted on a freed top-tier model
+#: (``[scheduler] upgrade_window``, SPEC §7; 0 disables upgrading).
+DEFAULT_UPGRADE_WINDOW = 1200.0
 
 _REQUIRED_ROOT_KEYS = ("plan", "prompt", "gate", "worktrees", "main")
 
@@ -103,6 +108,18 @@ class MergeConfig:
 
 
 @dataclass(frozen=True)
+class SchedulerConfig:
+    """The optional ``[scheduler]`` table (SPEC §7).
+
+    ``upgrade_window`` is how long ago a running agent may have been started to
+    still be worth restarting on a freed top-tier model (SPEC §7 "upgrade on
+    free"); ``0`` disables upgrading.  Accepts seconds or ``"20m"``.
+    """
+
+    upgrade_window: float = DEFAULT_UPGRADE_WINDOW
+
+
+@dataclass(frozen=True)
 class StatsConfig:
     """The optional ``[stats]`` table: trace time-bucket regexes (SPEC §9).
 
@@ -143,6 +160,7 @@ class Config:
     trailer: tuple[str, ...] = ()
     merge: MergeConfig = MergeConfig()
     stats: StatsConfig = StatsConfig()
+    scheduler: SchedulerConfig = SchedulerConfig()
 
     @property
     def root(self) -> Path:
@@ -203,6 +221,7 @@ def _build(data: Mapping[str, Any], path: Path) -> Config:
         trailer=_string_list(data, "trailer", path, where="", default=()),
         merge=_merge(data.get("merge"), path),
         stats=_stats(data.get("stats"), path),
+        scheduler=_scheduler(data.get("scheduler"), path),
     )
 
 
@@ -417,6 +436,20 @@ def _stats(raw: Any, path: Path) -> StatsConfig:
     return StatsConfig(buckets=tuple(buckets))
 
 
+def _scheduler(raw: Any, path: Path) -> SchedulerConfig:
+    """Validate the optional ``[scheduler]`` table (SPEC §7)."""
+    if raw is None:
+        return SchedulerConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: [scheduler] must be a table")
+    window = _duration(
+        raw, "upgrade_window", path, where="[scheduler] ", default=DEFAULT_UPGRADE_WINDOW
+    )
+    if window < 0:
+        raise ConfigError(f"{path}: '[scheduler] upgrade_window' must be >= 0, not {window!r}")
+    return SchedulerConfig(upgrade_window=window)
+
+
 def _string(
     table: Mapping[str, Any],
     key: str,
@@ -504,6 +537,31 @@ def _opt_int(
     if key not in table:
         return None
     return _int(table, key, path, where=where, minimum=minimum)
+
+
+def _duration(
+    table: Mapping[str, Any],
+    key: str,
+    path: Path,
+    *,
+    where: str,
+    default: float,
+) -> float:
+    """Return a duration in seconds from a number or a ``"20m"``/``"90s"`` string."""
+    if key not in table:
+        return default
+    value = table[key]
+    if isinstance(value, str):
+        try:
+            return duration.parse_seconds(value)
+        except ValueError:
+            pass
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    raise ConfigError(
+        f"{path}: '{where}{key}' must be a duration like '20m' or a number of seconds, "
+        f"not {value!r}"
+    )
 
 
 def _string_list(

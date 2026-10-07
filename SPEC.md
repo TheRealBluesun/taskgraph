@@ -188,6 +188,14 @@ start time matches the record; dead ones go through the normal "exited" path (re
 Single instance per project: `state/lock` holds the scheduler pid; refuse to start if that pid is alive.
 `taskgraph stop` stops the scheduler only (agents keep running); `taskgraph stop --agents` also stops agents.
 
+**Upgrade on free** (`taskgraph.upgrade`, pure `pick_upgrade`): when the top-priority model has a free `agent`
+slot and no runnable task is waiting for a slot, restart one running agent from a lower tier there through the
+normal resume path (same worktree, resume note). The task must be on the critical path (§3), have started at
+most `[scheduler] upgrade_window` ago (default `"20m"`; `0` disables), and be neither merging, already upgraded
+once nor `forced` onto its model (a quota `fallback` must not go back to the model that rate-limited it). At
+most one upgrade per tick and per task (no ping-pong); log `upgrade <id> <from> -> <to>`.
+*why:* a task that started when only the slow auxiliary tier had room kept it for hours while the local GPU idled.
+
 ## 8. Merge queue (`taskgraph.merge`)
 
 When an agent exits with `progress/<id>.done`, the task enters a FIFO merge queue processed by **one worker

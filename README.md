@@ -105,6 +105,11 @@ the two commits' messages, and the rule "keep both intents" — which may only `
 `git rebase --continue`, after which the normal build and gate decide. A resolver or gate failure still
 blocks the task, and every successful resolution is logged as `resolved <id> by agent (<n> files)`.
 
+When the top-priority model has a free agent slot and nothing is queued for it, a young agent running on
+a lower tier (started at most `[scheduler] upgrade_window` ago, default `"20m"`; `0` disables) is restarted
+there through the same resume path — critical path first, at most one per tick and per task. Each move is
+logged as `upgrade <id> <from> -> <to>`.
+
 ## Tests
 
 ```

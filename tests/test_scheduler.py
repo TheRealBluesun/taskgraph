@@ -74,13 +74,32 @@ name = "m1"
 sessions = {sessions}
 max_agents = {max_agents}
 {metrics}
-"""
+{extra}"""
 
 
 IDLE_AGENT = """\
 #!/bin/sh
 echo '{"type":"tool_execution_start","toolCallId":"1","toolName":"bash"}'
 sleep "${FAKE_SLEEP:-60}"
+"""
+
+# T01 finishes at once (freeing the top tier), T02 keeps working for a while
+# (the agent an upgrade should move over).
+UPGRADE_AGENT = """\
+#!/bin/sh
+id=$(basename "$PWD")
+echo "trace $id"
+case "$id" in
+  T01)
+    mkdir -p progress
+    printf -- "- did %s\\n" "$id" > "progress/$id.md"
+    : > "progress/$id.done"
+    ;;
+  *)
+    echo '{"type":"tool_execution_start","toolCallId":"1","toolName":"bash"}'
+    sleep "${T02_SLEEP:-30}"
+    ;;
+esac
 """
 
 
@@ -145,6 +164,7 @@ class ProjectTestCase(unittest.TestCase):
         worktrees="../wt",
         metrics="",
         merge="",
+        extra="",
     ):
         text = TOML.format(
             command=self.script if command is None else command,
@@ -156,6 +176,7 @@ class ProjectTestCase(unittest.TestCase):
             max_agents=sessions if max_agents is None else max_agents,
             worktrees=worktrees,
             metrics=metrics,
+            extra=extra,
         )
         text += merge
         path = self.root / "taskgraph.toml"
@@ -496,6 +517,7 @@ class DryRunTest(unittest.TestCase):
                 max_agents=1,
                 worktrees="../wt",
                 metrics="",
+                extra="",
             ),
             encoding="utf-8",
         )
@@ -591,6 +613,53 @@ class ResolverIntegrationTest(ProjectTestCase):
         self.assertRegex(events, r"(?m)^\d{2}:\d{2}:\d{2} resolved T0\d by agent \(1 files\)")
         self.assertEqual(events.count(" blocked "), 0)
         self.assertEqual(events.count(" merged "), 2)
+
+
+TWO_MODELS = '\n[[models]]\nname = "m2"\nsessions = 1\n'
+
+
+class UpgradeTest(ProjectTestCase):
+    """A freed top-tier slot pulls a young lower-tier agent over (SPEC §7, T22)."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_plan("- [ ] T01 first\n- [ ] T02 second\n")
+        self.script.write_text(UPGRADE_AGENT, encoding="utf-8")
+        self.script.chmod(0o755)
+
+    def test_young_lower_tier_agent_moves_to_a_freed_top_slot(self):
+        cfg = self.load_cfg(sessions=1, extra=TWO_MODELS)
+        sched = self.make_scheduler(cfg)
+        sched.start()
+        # T01 takes m1 and finishes at once; T02 then runs on m2. Once m1's slot
+        # is free and nothing is queued for it, T02 is restarted there.
+        self.pump(sched, lambda: " upgrade T02 " in self.events_text(), timeout=90)
+        for _ in range(3):
+            sched.tick()
+        sched.close()
+
+        events = self.events_text()
+        self.assertIn(" upgrade T02 m2 -> m1", events)
+        self.assertIn(" start T02 m2 ", events)
+        self.assertIn(" start T02 m1 ", events)
+        self.assertIn("(resume)", events)
+        self.assertEqual(events.count(" upgrade "), 1)  # never twice for one task
+        self.assertEqual(sched.running["T02"].model, "m1")
+        self.assertTrue(worktree.exists(cfg, "T02"))
+
+    def test_upgrade_window_zero_disables_upgrading(self):
+        cfg = self.load_cfg(
+            sessions=1, extra=TWO_MODELS + '\n[scheduler]\nupgrade_window = 0\n'
+        )
+        sched = self.make_scheduler(cfg)
+        sched.start()
+        self.pump(sched, lambda: " merged T01 " in self.events_text(), timeout=90)
+        for _ in range(3):
+            sched.tick()
+        sched.close()
+
+        self.assertNotIn(" upgrade ", self.events_text())
+        self.assertEqual(sched.running["T02"].model, "m2")
 
 
 if __name__ == "__main__":

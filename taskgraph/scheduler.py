@@ -25,7 +25,7 @@ import threading
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from . import (
     agent,
@@ -39,6 +39,7 @@ from . import (
     pool,
     resolve,
     state,
+    upgrade,
     worktree,
 )
 from .config import Config, ConfigError
@@ -100,6 +101,8 @@ class Scheduler:
         self.running: dict[str, agent.AgentRecord] = {}
         self.merging: set[str] = set()
         self.forced: dict[str, str] = {}
+        #: Tasks already moved to a better model once (SPEC §7 "one per task").
+        self.upgraded: set[str] = set()
         self._lease_anomalies: set[int] = set()
         self.idle = idle.IdleWatch()
         self._results: list[merge.MergeResult] = []
@@ -353,12 +356,18 @@ class Scheduler:
         self.queue.enqueue(tid)
 
     def _fill(self, now: float) -> None:
-        """Start runnable tasks while the model pool admits another agent."""
+        """Start runnable tasks, then upgrade one if the top tier is still free.
+
+        Runnable work has priority over an upgrade (SPEC §7): the ids the loop
+        left waiting are passed on, and the upgrade pick refuses to take a slot
+        they could use.
+        """
         text = self._plan_text()
         if text is None:
             return
+        tasks = plan.parse(text)
         ready = order.runnable(
-            plan.parse(text),
+            tasks,
             set(self.running) | self.merging,
             set(self.state.blocked),
             lambda task: worktree.started_rank(self.cfg, task.id),
@@ -384,6 +393,46 @@ class Scheduler:
                     continue  # this one wants a specific model; try the rest
                 break  # the pool is full for everyone
             self._start(task, name, assigned, now)
+        queued = [
+            task.id
+            for task in ready
+            if task.id not in self.running
+            and task.id not in self.merging
+            and task.id not in self.state.blocked
+        ]
+        if not self._stopping:
+            self._upgrade(now, tasks, queued)
+
+    def _upgrade(self, now: float, tasks: Mapping[str, plan.Task], queued: Sequence[str]) -> None:
+        """Restart one young lower-tier agent on a free top-tier slot (SPEC §7).
+
+        The worktree is reused through the normal resume path, so the agent
+        continues its partial work on the faster model; the task is remembered
+        so it is never moved twice.
+        """
+        models = self.cfg.models
+        assigned = Counter(record.model for record in self.running.values())
+        tid = upgrade.pick_upgrade(
+            tasks,
+            self.running,
+            models,
+            assigned,
+            now,
+            self.cfg.scheduler.upgrade_window,
+            queued=queued,
+            merging=self.merging,
+            upgraded=self.upgraded,
+            forced=self.forced,
+        )
+        if tid is None:
+            return
+        record = self.running.pop(tid)
+        agent.kill(record, timeout=self._kill_timeout)
+        self.upgraded.add(tid)
+        target = models[0].name
+        self._start(tasks[tid], target, assigned, now)
+        if tid in self.running:
+            self._event("upgrade", tid, f"{record.model} -> {target}")
 
     def _pick(self, tid: str, assigned: Mapping[str, int], now: float) -> str | None:
         """Return the model the pool gives task ``tid``, or ``None`` if full."""
