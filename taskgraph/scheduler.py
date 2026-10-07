@@ -6,7 +6,7 @@ One foreground process per project. Each tick it
   the model pool without a restart (SPEC §4);
 * records one metrics sample per model that has an endpoint;
 * drains finished merges and applies their outcome to state;
-* watches every running agent — exit, stall, startup hang, quota error;
+* watches every running agent — exit, stall, startup hang, degenerate loop, quota error;
 * starts the next runnable tasks the model pool admits (SPEC §3/§4), after
   handing already-finished work to the single merge worker (SPEC §8).
 
@@ -283,6 +283,14 @@ class Scheduler:
             if agent.startup_hang(record.log):
                 self._event("stall", record.id, "startup hang")
                 self._requeue(record, "startup hang")
+                continue
+            if agent.looping(record.log, self.cfg.runner.loop_window):
+                self._event(
+                    "stall",
+                    record.id,
+                    f"looping: last {self.cfg.runner.loop_window} tool calls identical",
+                )
+                self._requeue(record, "looping")
                 continue
             if agent.stalled(record.log, now, self.cfg.agent.stall_secs):
                 hold = agent.oldest_lease(record, root=self.state_root)

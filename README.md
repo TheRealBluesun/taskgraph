@@ -110,6 +110,12 @@ a lower tier (started at most `[scheduler] upgrade_window` ago, default `"20m"`;
 there through the same resume path — critical path first, at most one per tick and per task. Each move is
 logged as `upgrade <id> <from> -> <to>`.
 
+An agent that stops making progress is killed and resumed through the same path: no trace growth for
+`[agent] stall_secs` (unless a `taskgraph lease` wrapper in its worktree explains the silence), omp never
+starting (`Still starting after`), or a degenerate loop — its last `[runner] loop_window` tool calls
+(default 20) identical, i.e. the same name and arguments, as when a task issues the same `ls` thousands of
+times and the growing trace keeps the stall watchdog quiet. `loop_window = 0` disables the loop check.
+
 ## Tests
 
 ```

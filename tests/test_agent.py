@@ -5,6 +5,7 @@ process groups, real logs and real watchdogs — but never omp, a model or the
 network; every started group is killed on cleanup.
 """
 
+import json
 import os
 import subprocess
 import tempfile
@@ -246,6 +247,52 @@ class QuotaTest(AgentTestCase):
         record = self.record("quota exceeded")
         record.model = "ghost"
         self.assertIsNone(agent.fallback_model(record, self.cfg))
+
+
+class LoopTest(AgentTestCase):
+    """A degenerate repeat of the same tool call (SPEC §6 loop watchdog)."""
+
+    def log(self, *lines: str) -> Path:
+        path = self.base / "trace.log"
+        path.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+        return path
+
+    def call(self, command: str, call_id: str = "1") -> str:
+        return json.dumps(
+            {
+                "type": "tool_execution_start",
+                "toolCallId": call_id,
+                "toolName": "bash",
+                "args": {"command": command},
+            }
+        )
+
+    def test_the_same_call_repeated_is_a_loop(self):
+        log = self.log(*(self.call("ls", str(n)) for n in range(5)))
+        self.assertTrue(agent.looping(log, 3))
+        self.assertFalse(agent.looping(log, 6))  # fewer calls than the window
+
+    def test_moving_commands_are_not_a_loop(self):
+        self.assertFalse(agent.looping(self.log(*(self.call(f"ls {n}") for n in range(5))), 3))
+
+    def test_missing_trace_is_not_a_loop(self):
+        self.assertFalse(agent.looping(self.base / "nope.log", 3))
+
+    def test_zero_window_disables_the_check(self):
+        self.assertFalse(agent.looping(self.log(*(self.call("ls") for _ in range(30))), 0))
+
+    def test_a_live_agent_repeating_the_same_call_is_caught(self):
+        line = '{"type":"tool_execution_start","toolCallId":"x","toolName":"bash","args":{"command":"ls"}}'
+        script = self.script(
+            "i=0\n"
+            "while [ $i -lt 4 ]; do\n"
+            f"  echo '{line}'\n"
+            "  i=$((i+1))\n"
+            "done\n"
+            "exec sleep 30"
+        )
+        record = self.launch(f"{script}")
+        wait_for(lambda: agent.looping(record.log, 2) or None)
 
 
 class LeaseExemptionTest(AgentTestCase):

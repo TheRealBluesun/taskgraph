@@ -265,6 +265,25 @@ def oldest_lease(
     )
 
 
+def looping(log: Path | str, window: int) -> bool:
+    """Return whether the trace's last ``window`` tool calls are identical (SPEC §6).
+
+    A degenerate loop — the same call issued over and over — keeps the trace
+    growing, so :func:`stalled` never fires: Elixir's D5 ran the same ``ls``
+    ~12,000 times in two hours while every tick saw a fresh trace.  The call
+    identity is the tool name plus its arguments, so ordinary repeated ``bash``
+    work (different commands) is not a loop.  ``window <= 0`` disables the check.
+    """
+    if window <= 0:
+        return False
+    try:
+        handle = Path(log).open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    with handle:
+        return trace.repeated_tail(handle, window)
+
+
 def startup_hang(log: Path | str, *, head_lines: int = STARTUP_LINES) -> bool:
     """Return whether the trace shows omp never got going (SPEC §6).
 

@@ -174,6 +174,10 @@ Default overlay `share/omp-agent.yml` disables `bash.autoBackground` and `eval.a
 - **startup hang**: only while the trace has no `"type":"tool_execution_start"` yet, and only a line beginning
   `Still starting after` within the first 20 lines (*why:* an agent reading the runner's source put that phrase
   into its trace and the old check killed it).
+- **loop**: the last `[runner] loop_window` tool calls (default 20; `0` disables) all identical — same tool
+  name and same arguments; the per-call id is ignored — → kill and resume with reason `looping` (*why:* a
+  degenerate loop keeps the trace growing, so the stall watchdog alone never catches it: Elixir's D5 issued the
+  same `ls` ~12,000 times in 2 h while every tick saw fresh trace, 2026-10-06).
 - **quota**: trace contains a rate-limit/quota error and the model has a `fallback` model configured → restart
   on the fallback (counts as a retry).
 

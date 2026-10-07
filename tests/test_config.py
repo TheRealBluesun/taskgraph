@@ -11,6 +11,7 @@ from taskgraph.config import (
     ConfigError,
     MergeConfig,
     ModelConfig,
+    RunnerConfig,
     SchedulerConfig,
     StatsConfig,
     WorkerConfig,
@@ -236,6 +237,40 @@ class SchedulerConfigTest(ConfigTestBase):
         self.assert_error(
             MINIMAL_TOML.replace('main = "main"', 'main = "main"\nscheduler = 3'),
             "[scheduler] must be a table",
+        )
+
+
+class RunnerConfigTest(ConfigTestBase):
+    def test_defaults_to_a_window_of_20(self):
+        cfg = self.load_text(MINIMAL_TOML)
+        self.assertEqual(cfg.runner, RunnerConfig())
+        self.assertEqual(cfg.runner.loop_window, 20)
+
+    def test_loop_window_is_parsed(self):
+        cfg = self.load_text(MINIMAL_TOML + "\n[runner]\nloop_window = 5\n")
+        self.assertEqual(cfg.runner.loop_window, 5)
+
+    def test_zero_disables_the_loop_check(self):
+        cfg = self.load_text(MINIMAL_TOML + "\n[runner]\nloop_window = 0\n")
+        self.assertEqual(cfg.runner.loop_window, 0)
+
+    def test_negative_window_is_rejected(self):
+        err = self.assert_error(
+            MINIMAL_TOML + "\n[runner]\nloop_window = -1\n",
+            "'[runner] loop_window' must be >= 0",
+        )
+        self.assertIn("taskgraph.toml", str(err))
+
+    def test_window_must_be_an_integer(self):
+        self.assert_error(
+            MINIMAL_TOML + '\n[runner]\nloop_window = "20"\n',
+            "'[runner] loop_window' must be an integer",
+        )
+
+    def test_runner_must_be_a_table(self):
+        self.assert_error(
+            MINIMAL_TOML.replace('main = "main"', 'main = "main"\nrunner = 3'),
+            "[runner] must be a table",
         )
 
 

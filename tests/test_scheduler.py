@@ -397,6 +397,79 @@ class StallExemptTest(ProjectTestCase):
         self.assertFalse(agent.group_alive(record.pgid))
 
 
+LOOP_AGENT = """\
+#!/bin/sh
+echo "trace $(basename "$PWD")"
+i=0
+while [ $i -lt 4 ]; do
+  echo '{"type":"tool_execution_start","toolCallId":"x","toolName":"bash","args":{"command":"ls"}}'
+  i=$((i+1))
+done
+exec sleep "${FAKE_SLEEP:-30}"
+"""
+
+
+class LoopGuardTest(ProjectTestCase):
+    """An agent repeating the same tool call is killed and resumed (SPEC §6 loop)."""
+
+    def loop_agent(self) -> Path:
+        """A fake agent that issues the same ``ls`` call over and over, then sleeps."""
+        script = self.base / "loop-agent.sh"
+        script.write_text(LOOP_AGENT, encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    def trace_calls(self, record) -> int:
+        try:
+            return Path(record.log).read_text(encoding="utf-8").count("tool_execution_start")
+        except OSError:
+            return 0
+
+    def test_a_looping_agent_is_killed_resumed_then_blocked(self):
+        self.write_plan(PLAN_1)
+        cfg = self.load_cfg(
+            sessions=1,
+            retries=1,
+            stall_secs=3600,  # only the repeated call sequence may kill this agent
+            command=self.loop_agent(),
+            extra="[runner]\nloop_window = 3\n",
+        )
+        sched = self.make_scheduler(cfg)
+        sched.start()
+        with mock.patch.dict(os.environ, {"FAKE_SLEEP": "30"}):
+            self.pump(sched, lambda: "T01" in sched.state.blocked)
+        sched.close()
+
+        events = self.events_text()
+        self.assertIn("stall T01 looping: last 3 tool calls identical", events)
+        self.assertIn("retry T01 looping", events)
+        self.assertIn("blocked T01 looping", events)
+        self.assertEqual(events.count(" start T01"), 2)
+        self.assertEqual(sched.state.retries["T01"], 1)
+
+    def test_a_window_of_zero_disables_the_guard(self):
+        self.write_plan(PLAN_1)
+        cfg = self.load_cfg(
+            sessions=1,
+            retries=0,
+            stall_secs=3600,
+            command=self.loop_agent(),
+            extra="[runner]\nloop_window = 0\n",
+        )
+        sched = self.make_scheduler(cfg)
+        sched.start()
+        with mock.patch.dict(os.environ, {"FAKE_SLEEP": "30"}):
+            sched.tick()
+            record = sched.running["T01"]
+            wait_until(lambda: self.trace_calls(record) >= 4)
+            sched.tick()
+            sched.tick()
+            self.assertNotIn("looping", self.events_text())
+            self.assertEqual(agent.poll(record), "running")
+            agent.kill(record, timeout=5)
+        sched.close()
+
+
 class IdleWatchTest(ProjectTestCase):
     """A model with agents but no requests is reported once, with a diagnosis (SPEC §9)."""
 

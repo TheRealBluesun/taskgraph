@@ -23,6 +23,10 @@ DEFAULT_STALL_SECS = 480.0
 DEFAULT_MAX_LEASE_SECS = 1800.0
 DEFAULT_RETRIES = 2
 
+#: How many consecutive identical tool calls mean a degenerate loop
+#: (``[runner] loop_window``, SPEC §6; 0 disables the check).
+DEFAULT_LOOP_WINDOW = 20
+
 #: How young a running agent must be to be restarted on a freed top-tier model
 #: (``[scheduler] upgrade_window``, SPEC §7; 0 disables upgrading).
 DEFAULT_UPGRADE_WINDOW = 1200.0
@@ -88,6 +92,18 @@ class AgentConfig:
     max_lease_secs: float = DEFAULT_MAX_LEASE_SECS
     retries: int = DEFAULT_RETRIES
     deny: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RunnerConfig:
+    """The optional ``[runner]`` table: watchdogs of the agent runner (SPEC §6).
+
+    ``loop_window`` is how many consecutive identical tool calls mark a
+    degenerate loop (the agent is killed and resumed); ``0`` disables the check,
+    which is the escape hatch for a task whose work really is the same call.
+    """
+
+    loop_window: int = DEFAULT_LOOP_WINDOW
 
 
 @dataclass(frozen=True)
@@ -161,6 +177,7 @@ class Config:
     merge: MergeConfig = MergeConfig()
     stats: StatsConfig = StatsConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
+    runner: RunnerConfig = RunnerConfig()
 
     @property
     def root(self) -> Path:
@@ -222,6 +239,7 @@ def _build(data: Mapping[str, Any], path: Path) -> Config:
         merge=_merge(data.get("merge"), path),
         stats=_stats(data.get("stats"), path),
         scheduler=_scheduler(data.get("scheduler"), path),
+        runner=_runner(data.get("runner"), path),
     )
 
 
@@ -448,6 +466,18 @@ def _scheduler(raw: Any, path: Path) -> SchedulerConfig:
     if window < 0:
         raise ConfigError(f"{path}: '[scheduler] upgrade_window' must be >= 0, not {window!r}")
     return SchedulerConfig(upgrade_window=window)
+
+
+def _runner(raw: Any, path: Path) -> RunnerConfig:
+    """Validate the optional ``[runner]`` table (SPEC §6 loop watchdog)."""
+    if raw is None:
+        return RunnerConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: [runner] must be a table")
+    window = _int(
+        raw, "loop_window", path, where="[runner] ", default=DEFAULT_LOOP_WINDOW, minimum=0
+    )
+    return RunnerConfig(loop_window=window)
 
 
 def _string(

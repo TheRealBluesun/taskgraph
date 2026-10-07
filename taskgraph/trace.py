@@ -12,10 +12,11 @@ ISO; both end up as epoch seconds here).
 from __future__ import annotations
 
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 #: Values at or above this are epoch milliseconds, not seconds (~1973 in ms).
 _MS_THRESHOLD = 1e11
@@ -84,6 +85,43 @@ def epoch(value: Any) -> float | None:
             except ValueError:
                 return None
     return None
+
+
+def call_signature(parsed: Mapping[str, Any]) -> str:
+    """A stable identity for one ``tool_execution_start`` event (SPEC §6).
+
+    The tool name plus its canonicalised arguments.  ``toolCallId`` is excluded
+    on purpose: it is fresh for every call, while a degenerate loop repeats the
+    same call (the same ``ls``) verbatim over and over.
+    """
+    name = str(parsed.get("toolName") or "?")
+    args = parsed.get("args")
+    try:
+        rendered = json.dumps(args, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):  # pragma: no cover - default=str covers everything
+        rendered = repr(args)
+    return f"{name} {rendered}"
+
+
+def repeated_tail(lines: Iterable[str], window: int) -> bool:
+    """Whether the last ``window`` tool calls in ``lines`` are all identical (SPEC §6).
+
+    Only real ``tool_execution_start`` events count, so prose echoing the phrase
+    is ignored; a junk line is skipped by the parser.  ``False`` when fewer than
+    ``window`` calls happened, and ``window <= 0`` disables the check.  Streams
+    the lines, so a huge trace costs no more memory than any other view of it.
+    """
+    if window <= 0:
+        return False
+    recent: deque[str] = deque(maxlen=window)
+    for line in lines:
+        if TOOL_START not in line:
+            continue
+        parsed = event(line)
+        if parsed is None or parsed.get("type") != TOOL_START:
+            continue
+        recent.append(call_signature(parsed))
+    return len(recent) == window and len(set(recent)) == 1
 
 
 def last_tool(path: Path | str) -> str | None:

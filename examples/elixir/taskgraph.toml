@@ -21,6 +21,13 @@ max_lease_secs = 1800                       # a lease held longer than 30 min is
 retries = 2                                 # resumes after an agent exits without .done, then blocks
 deny = ["xcodebuild", "xcrun"]              # one simulator: agents must go through ./dev.sh
 
+# Watchdogs that stop a stuck agent and resume it from its worktree (SPEC §6). An agent whose last N
+# tool calls are identical — same tool, same arguments — is in a degenerate loop: the trace keeps
+# growing, so the stall watchdog below never fires (D5 ran the same `ls` ~12,000 times). `0` disables
+# the check for a task whose work genuinely is the same call repeated.
+[runner]
+loop_window = 20
+
 # Counting semaphores shared by every process on the machine (SPEC §5). Elixir has exactly one
 # simulator, so capacity 1; add `build = 1` here if you also want the compile step serialized.
 [resources]
